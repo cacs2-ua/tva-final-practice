@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union, Literal
 
 import numpy as np
 import cv2 as cv
-
 
 Array = np.ndarray
 
@@ -21,8 +20,21 @@ class FOVMaskDebug:
     largest_cc: Array
     filled: Array
     convex_hull: Array
+    ellipse_mask: Array
+    final: Array
     chosen_inverted: bool
     scores: Dict[str, float]
+    ellipse_used: bool
+    ellipse_reason: str
+
+
+def _to_uint8(gray: Array) -> Array:
+    if gray.dtype == np.uint8:
+        return gray
+    g = gray.astype(np.float32)
+    g = g - g.min()
+    denom = (g.max() - g.min()) if (g.max() - g.min()) > 1e-6 else 1.0
+    return (255.0 * g / denom).clip(0, 255).astype(np.uint8)
 
 
 def _to_gray_or_green(img: Array) -> Array:
@@ -39,23 +51,35 @@ def _to_gray_or_green(img: Array) -> Array:
         gray = img[:, :, 1]  # green channel
     else:
         raise ValueError(f"Unsupported image shape: {img.shape}")
-
-    if gray.dtype != np.uint8:
-        # Normalize to uint8 safely
-        g = gray.astype(np.float32)
-        g = g - g.min()
-        denom = (g.max() - g.min()) if (g.max() - g.min()) > 1e-6 else 1.0
-        g = (255.0 * g / denom).clip(0, 255).astype(np.uint8)
-        gray = g
-    return gray
+    return _to_uint8(gray)
 
 
-def _morph_cleanup(mask: Array,
-                   close_ksize: int = 25,
-                   open_ksize: int = 9) -> Array:
+def _ensure_odd(k: int) -> int:
+    k = int(k)
+    if k < 1:
+        k = 1
+    if k % 2 == 0:
+        k += 1
+    return k
+
+
+def _auto_ksizes(h: int, w: int) -> Tuple[int, int]:
+    """
+    Auto choose morphology kernel sizes based on image diagonal.
+    Tuned to be "safe" for common fundus sizes (e.g., DRIVE 768x584).
+    """
+    diag = float(np.hypot(h, w))
+    close_k = _ensure_odd(int(round(diag * 0.035)))  # ~33 for DRIVE
+    open_k = _ensure_odd(int(round(diag * 0.012)))   # ~11 for DRIVE
+    close_k = max(close_k, 25)
+    open_k = max(open_k, 9)
+    return close_k, open_k
+
+
+def _morph_cleanup(mask: Array, close_ksize: int, open_ksize: int) -> Array:
     """Close gaps then open to remove specks."""
-    if close_ksize % 2 == 0 or open_ksize % 2 == 0:
-        raise ValueError("Kernel sizes must be odd.")
+    close_ksize = _ensure_odd(close_ksize)
+    open_ksize = _ensure_odd(open_ksize)
 
     close_k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (close_ksize, close_ksize))
     open_k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (open_ksize, open_ksize))
@@ -67,14 +91,11 @@ def _morph_cleanup(mask: Array,
 
 def _largest_connected_component(mask: Array) -> Array:
     """Return a binary mask (0/255) containing only the largest foreground CC."""
-    if mask.dtype != np.uint8:
-        mask = mask.astype(np.uint8)
-
-    num, labels, stats, _ = cv.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    m = (mask > 0).astype(np.uint8)
+    num, labels, stats, _ = cv.connectedComponentsWithStats(m, connectivity=8)
     if num <= 1:
         return np.zeros_like(mask, dtype=np.uint8)
 
-    # stats: [label, x, y, w, h, area] for labels 0..num-1
     areas = stats[1:, cv.CC_STAT_AREA]
     best_idx = 1 + int(np.argmax(areas))
     out = np.zeros_like(mask, dtype=np.uint8)
@@ -86,17 +107,34 @@ def _fill_holes(mask: Array) -> Array:
     """
     Fill holes inside a binary object using flood-fill on the background.
     Input/Output are 0/255 uint8.
+    More robust than using only (0,0) as seed.
     """
     m = (mask > 0).astype(np.uint8) * 255
     h, w = m.shape[:2]
+    if h == 0 or w == 0:
+        return m
 
-    # Flood fill from border on inverted mask to find external background
+    # find a background seed on the border
+    border_coords = []
+    border_coords += [(0, x) for x in range(w)]
+    border_coords += [(h - 1, x) for x in range(w)]
+    border_coords += [(y, 0) for y in range(h)]
+    border_coords += [(y, w - 1) for y in range(h)]
+
+    seed = None
+    for (yy, xx) in border_coords:
+        if m[yy, xx] == 0:
+            seed = (xx, yy)  # floodFill uses (x,y)
+            break
+    if seed is None:
+        # mask covers the whole border; nothing to flood-fill safely
+        return m
+
     inv = cv.bitwise_not(m)
     ff = inv.copy()
     flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    cv.floodFill(ff, flood_mask, (0, 0), 0)  # fill external background to 0
+    cv.floodFill(ff, flood_mask, seedPoint=seed, newVal=0)
 
-    # Holes are the remaining white regions in ff
     holes = (ff > 0).astype(np.uint8) * 255
     filled = cv.bitwise_or(m, holes)
     return filled
@@ -122,8 +160,8 @@ def _candidate_score(candidate_mask: Array) -> float:
     Heuristics (good FOV):
       - large area but not the whole image
       - centered
-      - low border contact (FOV usually doesn't touch border if black margin exists)
-      - reasonably compact (circular-ish)
+      - low border contact
+      - reasonably compact
     """
     m = (candidate_mask > 0).astype(np.uint8)
     h, w = m.shape[:2]
@@ -133,17 +171,14 @@ def _candidate_score(candidate_mask: Array) -> float:
     if area < 10:
         return -1e9
 
-    # Border contact ratio
     border = np.concatenate([m[0, :], m[-1, :], m[:, 0], m[:, -1]])
-    border_ratio = float(border.mean())  # fraction of border that is foreground
+    border_ratio = float(border.mean())
 
-    # Centroid distance to image center (normalized)
     ys, xs = np.where(m > 0)
     cy, cx = float(np.mean(ys)), float(np.mean(xs))
     center_dist = np.sqrt((cy - (h / 2.0)) ** 2 + (cx - (w / 2.0)) ** 2)
     center_dist_norm = center_dist / np.sqrt((h / 2.0) ** 2 + (w / 2.0) ** 2)
 
-    # Compactness via contour circularity (if possible)
     circ = 0.0
     m255 = (m * 255).astype(np.uint8)
     contours, _ = cv.findContours(m255, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
@@ -151,18 +186,9 @@ def _candidate_score(candidate_mask: Array) -> float:
         cnt = max(contours, key=cv.contourArea)
         A = float(cv.contourArea(cnt))
         P = float(cv.arcLength(cnt, True))
-        circ = (4.0 * np.pi * A) / (P * P + 1e-6)  # 0..1-ish
+        circ = (4.0 * np.pi * A) / (P * P + 1e-6)
 
-    # Prefer:
-    # - area_ratio in [~0.15 .. ~0.95]
-    # - small border_ratio
-    # - small center_dist_norm
-    # - higher circ
-    # Combine into a single score:
-    if area_ratio < 0.10 or area_ratio > 0.98:
-        area_penalty = 0.6
-    else:
-        area_penalty = 0.0
+    area_penalty = 0.6 if (area_ratio < 0.10 or area_ratio > 0.98) else 0.0
 
     score = (
         + 1.5 * area_ratio
@@ -174,29 +200,82 @@ def _candidate_score(candidate_mask: Array) -> float:
     return float(score)
 
 
+def _fit_ellipse_mask_from_contour(mask: Array, scale: float = 1.02) -> Tuple[Array, bool, str]:
+    """
+    Fit an ellipse to the outer contour and return an ellipse mask.
+    scale > 1 expands ellipse slightly (useful to recover small border bites).
+    """
+    m = (mask > 0).astype(np.uint8) * 255
+    h, w = m.shape[:2]
+    contours, _ = cv.findContours(m, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    if not contours:
+        return np.zeros_like(m, dtype=np.uint8), False, "no_contours"
+
+    cnt = max(contours, key=cv.contourArea)
+    if len(cnt) < 5:
+        return m.copy(), False, "too_few_points_for_ellipse"
+
+    (cx, cy), (MA, ma), angle = cv.fitEllipse(cnt)  # widths (full axis lengths)
+    rx = max(1, int(round((MA * 0.5) * scale)))
+    ry = max(1, int(round((ma * 0.5) * scale)))
+
+    out = np.zeros((h, w), dtype=np.uint8)
+    cv.ellipse(out, (int(round(cx)), int(round(cy))), (rx, ry), angle, 0, 360, 255, thickness=cv.FILLED)
+    return out, True, "fitEllipse"
+
+
+def _should_use_ellipse(mask: Array, min_fill_ratio: float = 0.975) -> Tuple[bool, str]:
+    """
+    Detect the classic 'straight bite' problem:
+    the shape is convex, so convex hull won't help, but area is noticeably below
+    the best-fitting enclosing shape.
+
+    We compare mask area vs minimum enclosing circle area.
+    If the ratio is too low, it suggests a 'cut' happened.
+    """
+    m = (mask > 0).astype(np.uint8) * 255
+    contours, _ = cv.findContours(m, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return False, "no_contours"
+
+    cnt = max(contours, key=cv.contourArea)
+    A = float(cv.contourArea(cnt))
+    if A < 100:
+        return False, "tiny_area"
+
+    (x, y), r = cv.minEnclosingCircle(cnt)
+    circle_area = float(np.pi * (r * r) + 1e-6)
+    fill_ratio = A / circle_area
+
+    if fill_ratio < min_fill_ratio:
+        return True, f"low_fill_ratio_vs_enclosing_circle ({fill_ratio:.3f} < {min_fill_ratio:.3f})"
+    return False, f"ok_fill_ratio ({fill_ratio:.3f})"
+
+
+EllipseMode = Literal["off", "auto", "force"]
+
+
 def compute_fov_mask(
     img_or_path: Union[str, Array],
     *,
     blur_ksize: int = 7,
-    blur_kind: str = "median",   # "median" or "gaussian"
-    close_ksize: int = 25,
-    open_ksize: int = 9,
+    blur_kind: str = "median",     # "median" or "gaussian"
+    close_ksize: Optional[int] = None,  # None => auto
+    open_ksize: Optional[int] = None,   # None => auto
     do_hole_fill: bool = True,
     do_convex_hull: bool = True,
+    ellipse_mode: EllipseMode = "auto",  # off / auto / force
+    ellipse_scale: float = 1.02,         # slightly enlarge to recover small bites
+    ellipse_min_fill_ratio: float = 0.975,
     return_debug: bool = False,
 ) -> Union[Array, Tuple[Array, FOVMaskDebug]]:
     """
     Compute a clean binary Field-Of-View (FOV) mask (0/255 uint8) for a fundus image.
 
-    Pipeline:
-      1) green channel / grayscale
-      2) blur
-      3) Otsu threshold
-      4) try both polarities (normal + inverted), pick best by heuristic score
-      5) morphology close + open
-      6) largest connected component
-      7) optional hole filling
-      8) optional convex hull
+    Fixes supported (exactly what we discussed):
+      1) stronger closing (auto close/open sizes are bigger by default)
+      2) convex hull (optional)
+      3) ellipse fitting (robust for convex 'bites' that hull cannot fix)
 
     Returns:
       mask (uint8 0/255), and optionally debug object.
@@ -210,10 +289,18 @@ def compute_fov_mask(
         img = img_or_path
 
     g = _to_gray_or_green(img)
+    h, w = g.shape[:2]
+
+    # Auto kernel sizes if not provided
+    if close_ksize is None or open_ksize is None:
+        auto_close, auto_open = _auto_ksizes(h, w)
+        if close_ksize is None:
+            close_ksize = auto_close
+        if open_ksize is None:
+            open_ksize = auto_open
 
     # Blur
-    if blur_ksize % 2 == 0:
-        raise ValueError("blur_ksize must be odd.")
+    blur_ksize = _ensure_odd(blur_ksize)
     if blur_kind.lower() == "median":
         blurred = cv.medianBlur(g, blur_ksize)
     elif blur_kind.lower() == "gaussian":
@@ -228,7 +315,7 @@ def compute_fov_mask(
     cand_a = otsu
     cand_b = cv.bitwise_not(otsu)
 
-    # Morph cleanup each candidate
+    # Morph cleanup each candidate (this is where close fixes bites)
     cand_a_m = _morph_cleanup(cand_a, close_ksize=close_ksize, open_ksize=open_ksize)
     cand_b_m = _morph_cleanup(cand_b, close_ksize=close_ksize, open_ksize=open_ksize)
 
@@ -244,15 +331,36 @@ def compute_fov_mask(
         chosen = cand_b_l
         chosen_inverted = True
         scores = {"normal": score_a, "inverted": score_b}
+        after_morph = cand_b_m
     else:
         chosen = cand_a_l
         chosen_inverted = False
         scores = {"normal": score_a, "inverted": score_b}
+        after_morph = cand_a_m
 
     filled = _fill_holes(chosen) if do_hole_fill else chosen.copy()
     hull = _convex_hull(filled) if do_convex_hull else filled.copy()
 
-    final = (hull > 0).astype(np.uint8) * 255
+    # Ellipse handling (robust for convex straight "bites")
+    ellipse_used = False
+    ellipse_reason = "off"
+    ellipse_mask = np.zeros_like(hull)
+
+    if ellipse_mode == "force":
+        ellipse_mask, ellipse_used, ellipse_reason = _fit_ellipse_mask_from_contour(hull, scale=ellipse_scale)
+        final = ellipse_mask
+    elif ellipse_mode == "auto":
+        need, why = _should_use_ellipse(hull, min_fill_ratio=ellipse_min_fill_ratio)
+        ellipse_reason = why
+        if need:
+            ellipse_mask, ellipse_used, _ = _fit_ellipse_mask_from_contour(hull, scale=ellipse_scale)
+            final = ellipse_mask
+        else:
+            final = hull
+    else:  # "off"
+        final = hull
+
+    final = (final > 0).astype(np.uint8) * 255
 
     if not return_debug:
         return final
@@ -262,11 +370,15 @@ def compute_fov_mask(
         blurred=blurred,
         otsu=otsu,
         candidate_chosen=chosen,
-        after_morph=(cand_b_m if chosen_inverted else cand_a_m),
+        after_morph=after_morph,
         largest_cc=chosen,
         filled=filled,
         convex_hull=hull,
+        ellipse_mask=ellipse_mask,
+        final=final,
         chosen_inverted=chosen_inverted,
         scores=scores,
+        ellipse_used=ellipse_used,
+        ellipse_reason=ellipse_reason,
     )
     return final, dbg
