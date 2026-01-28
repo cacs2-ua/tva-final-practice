@@ -61,8 +61,8 @@ def test_circle_fov_high_iou_with_noise_and_holes():
     mask = compute_fov_mask(
         img,
         blur_kind="median",
-        blur_ksize=7,
-        close_ksize=25,
+        blur_ksize=9,
+        close_ksize=21,
         open_ksize=9,
         do_hole_fill=True,
         do_convex_hull=True,
@@ -90,8 +90,8 @@ def test_ellipse_fov_detected():
     mask = compute_fov_mask(
         img,
         blur_kind="gaussian",
-        blur_ksize=7,
-        close_ksize=31,
+        blur_ksize=9,
+        close_ksize=21,
         open_ksize=11,
         do_hole_fill=True,
         do_convex_hull=True,
