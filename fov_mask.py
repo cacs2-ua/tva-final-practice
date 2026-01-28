@@ -36,6 +36,20 @@ def _to_uint8(gray: Array) -> Array:
     denom = (g.max() - g.min()) if (g.max() - g.min()) > 1e-6 else 1.0
     return (255.0 * g / denom).clip(0, 255).astype(np.uint8)
 
+def _flatfield_for_otsu(g: Array) -> Array:
+    """
+    Remove slow illumination gradients (vignetting) so global thresholding
+    doesn't 'eat' the dark retinal rim.
+    """
+    h, w = g.shape[:2]
+    sigma = 0.12 * float(min(h, w))  # large blur = illumination field
+    bg = cv.GaussianBlur(g, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+    # flat-field: g / bg
+    corr = cv.divide(g, bg, scale=255.0)
+    corr = cv.normalize(corr, None, 0, 255, cv.NORM_MINMAX)
+    return corr.astype(np.uint8)
+
 
 def _to_gray_or_green(img: Array) -> Array:
     """
@@ -222,6 +236,57 @@ def _fit_ellipse_mask_from_contour(mask: Array, scale: float = 1.02) -> Tuple[Ar
     out = np.zeros((h, w), dtype=np.uint8)
     cv.ellipse(out, (int(round(cx)), int(round(cy))), (rx, ry), angle, 0, 360, 255, thickness=cv.FILLED)
     return out, True, "fitEllipse"
+
+def _fit_ellipse_mask_from_ring_edges(
+    g: Array,
+    mask: Array,
+    *,
+    scale: float = 1.01,
+    ring_width: int = 25,
+) -> Tuple[Array, bool, str]:
+    """
+    Fit ellipse from Canny edges located in a thin ring around the mask border.
+    This avoids bias from a truncated (bitten) filled region.
+    """
+    g = _to_uint8(g)
+    m = (mask > 0).astype(np.uint8) * 255
+    h, w = m.shape[:2]
+
+    ring_width = max(5, int(ring_width))
+    k = _ensure_odd(ring_width)
+    se = cv.getStructuringElement(cv.MORPH_ELLIPSE, (k, k))
+
+    dil = cv.dilate(m, se)
+    ero = cv.erode(m, se)
+    ring = cv.bitwise_and(dil, cv.bitwise_not(ero))  # border band
+
+    # Auto Canny thresholds from median intensity INSIDE the mask
+    inside = g[m > 0]
+    if inside.size < 50:
+        return np.zeros_like(m), False, "ring:too_few_inside_pixels"
+    med = float(np.median(inside))
+    lower = int(max(0, 0.66 * med))
+    upper = int(min(255, 1.33 * med))
+
+    edges = cv.Canny(g, lower, upper)
+    edges = cv.bitwise_and(edges, ring)
+
+    ys, xs = np.where(edges > 0)
+    if ys.size < 80:
+        return np.zeros_like(m), False, f"ring:not_enough_edge_points ({ys.size})"
+
+    pts = np.stack([xs, ys], axis=1).astype(np.int32).reshape(-1, 1, 2)
+
+    # fitEllipse needs >=5 points (we have plenty)
+    (cx, cy), (MA, ma), angle = cv.fitEllipse(pts)
+
+    rx = max(1, int(round((MA * 0.5) * scale)))
+    ry = max(1, int(round((ma * 0.5) * scale)))
+
+    out = np.zeros((h, w), dtype=np.uint8)
+    cv.ellipse(out, (int(round(cx)), int(round(cy))), (rx, ry), angle, 0, 360, 255, thickness=cv.FILLED)
+    return out, True, "ring:edge_fitEllipse"
+
 
 
 def _should_use_ellipse(mask: Array, min_fill_ratio: float = 0.975) -> Tuple[bool, str]:
@@ -420,9 +485,9 @@ def compute_fov_mask(
         blurred = cv.GaussianBlur(g, (blur_ksize, blur_ksize), 0)
     else:
         raise ValueError("blur_kind must be 'median' or 'gaussian'.")
-
+    g_corr = _flatfield_for_otsu(blurred)
     # Otsu threshold
-    _, otsu = cv.threshold(blurred, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    _, otsu = cv.threshold(g_corr, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
 
     # Two candidates: otsu foreground or inverted foreground
     cand_a = otsu
@@ -467,16 +532,16 @@ def compute_fov_mask(
         ellipse_reason = why
         if need:
             # NEW: fit from real image boundary (robust to the 'chord' failure)
-            ellipse_mask, ellipse_used, fit_why = _fit_ellipse_mask_from_radial_edges(
-                g, hull, scale=ellipse_scale
+            ellipse_mask, ellipse_used, fit_why = _fit_ellipse_mask_from_ring_edges(
+                g_corr, hull, scale=ellipse_scale, ring_width=25
             )
             if ellipse_used:
-                ellipse_reason = f"{why} | {fit_why}"
+                ellipse_reason = f"{ellipse_reason} | {fit_why}"
                 final = ellipse_mask
             else:
-                # Fallback to old behavior
-                ellipse_mask, ellipse_used, fit_why = _fit_ellipse_mask_from_contour(hull, scale=ellipse_scale)
-                ellipse_reason = f"{why} | fallback:{fit_why}"
+                # fallback to your old contour-based ellipse
+                ellipse_mask, ellipse_used, fit_why2 = _fit_ellipse_mask_from_contour(hull, scale=ellipse_scale)
+                ellipse_reason = f"{ellipse_reason} | fallback:{fit_why2}"
                 final = ellipse_mask if ellipse_used else hull
         else:
             final = hull
