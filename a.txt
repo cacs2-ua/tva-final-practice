@@ -53,9 +53,7 @@ Step 2 — Segment blood vessels inside the retina mask
 
 Below are several full pipelines. Each one is built around one of your listed techniques (Green channel / CLAHE / Morphology / GraphCut / Connected Components / k-Means), but in reality good vessel segmentation is always a pipeline.
 
-Pipeline A (Paper 2–inspired “strong classical”): Illumination correction → vessel enhancement → Graph Cut
-
-This is the closest to Paper 2’s philosophy (Retinex + enhancement + graph cut), but implementable with typical Python tools.
+Pipeline A: Illumination correction → vessel enhancement → Graph Cut
 
 Core technique: GraphCut (plus others)
 
@@ -65,13 +63,13 @@ Use Green channel (best vessel contrast in color fundus).
 
 Illumination correction (Retinex-like):
 
-Approximate Retinex with: log(I+1) - log(bilateral(I)+1) (Paper 2 uses bilateral Retinex).
+Approximate Retinex with: log(I+1) - log(bilateral(I)+1)
 
 Alternative: large-kernel background subtraction (morphological opening) or homomorphic filtering.
 
-Contrast boost: CLAHE (local contrast; Paper 2 discusses why local contrast methods help with inhomogeneity).
+Contrast boost: CLAHE (local contrast; in the papers it is discussed why local contrast methods help with inhomogeneity).
 
-Vessel enhancement (Paper 2 uses local phase, which is not native OpenCV):
+Vessel enhancement (In the papers it is used local phase, which is not native OpenCV):
 
 Practical substitutes:
 
@@ -101,12 +99,12 @@ Connected components to remove tiny blobs
 
 Optional thinning/skeleton (if you need centerlines)
 
-✅ This is usually the most “publication-like classical pipeline” (Paper 2 is a strong reference).
+✅ This is usually the most “publication-like classical pipeline”.
 GraphCut used alone? No—GraphCut needs a good vesselness/unary map and decent initialization.
 
-Pipeline B (Paper 1–inspired “simple + effective”): Morphology → k-means → cleanup
+Pipeline B  Morphology → k-means → cleanup
 
-This matches Paper 1 very well (morphology smoothing + k-means on DRIVE).
+(morphology smoothing + k-means on DRIVE).
 
 Core technique: k-Means (plus others)
 
@@ -144,7 +142,6 @@ Connected components filter (remove small objects)
 
 Optional small-gap bridging (morphological reconstruction / dilation-then-thinning)
 
-✅ Very notebook-friendly and aligns with Paper 1.
 k-Means used alone? You can cluster raw green channel, but results are usually poor without illumination correction + enhancement.
 
 Pipeline C (fast “OpenCV-only baseline”): Green channel → CLAHE → morphology → threshold
@@ -242,11 +239,11 @@ Green channel → almost always the base input (best contrast).
 
 CLAHE → improves thin vessels under uneven illumination; usually before enhancement.
 
-Morphological ops → vessel enhancement + cleanup; can be the “main engine” (Paper 1 style).
+Morphological ops → vessel enhancement + cleanup; can be the “main engine”
 
-k-Means → turns enhanced image into vessel/background classes (Paper 1).
+k-Means → turns enhanced image into vessel/background classes
 
-GraphCut → strong refinement/segmentation if you have a good vesselness/unary map (Paper 2 style).
+GraphCut → strong refinement/segmentation if you have a good vesselness/unary map
 
 Connected components → mandatory post-filtering, not a segmenter by itself.
 
@@ -257,3 +254,7 @@ These are common in the literature (and consistent with your review paper’s ca
 Frangi / Hessian vesselness (multi-scale): very standard vessel enhancement.
 
 Matched filter bank (Gaussian line profiles at multiple angles/scales).
+
+Supervised ML (if allowed): pixel features (intensity + gradients + filter responses) → RandomForest/SVM.
+
+Deep learning (U-Net): best accuracy if training data + time are allowed; but may be outside a “classical OpenCV” practice.
