@@ -254,6 +254,119 @@ def _should_use_ellipse(mask: Array, min_fill_ratio: float = 0.975) -> Tuple[boo
 
 EllipseMode = Literal["off", "auto", "force"]
 
+def _fit_ellipse_mask_from_radial_edges(
+    g: Array,
+    coarse_mask: Array,
+    *,
+    scale: float = 1.01,
+    n_angles: int = 360,
+    smooth_k: int = 9,
+) -> Tuple[Array, bool, str]:
+    """
+    Fit an ellipse using boundary points detected from the ORIGINAL image (g),
+    by finding the strongest outward intensity drop along radial rays.
+    This is robust when the coarse mask has a 'chord' cut (Otsu/vignetting failure).
+    """
+    g = _to_uint8(g)
+    m = (coarse_mask > 0).astype(np.uint8) * 255
+    h, w = m.shape[:2]
+
+    contours, _ = cv.findContours(m, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    if not contours:
+        return np.zeros_like(m, dtype=np.uint8), False, "radial:no_contours"
+
+    cnt = max(contours, key=cv.contourArea)
+    if cv.contourArea(cnt) < 100:
+        return np.zeros_like(m, dtype=np.uint8), False, "radial:tiny_area"
+
+    # Use minEnclosingCircle center as a stable center guess (better than centroid when truncated)
+    (cx, cy), r_guess = cv.minEnclosingCircle(cnt)
+    cx = float(cx)
+    cy = float(cy)
+    r_guess = float(r_guess)
+
+    if r_guess < 5:
+        cx, cy = (w / 2.0), (h / 2.0)
+        r_guess = 0.5 * min(h, w)
+
+    # Smooth kernel for 1D profiles
+    smooth_k = max(3, int(smooth_k))
+    if smooth_k % 2 == 0:
+        smooth_k += 1
+    kernel = np.ones(smooth_k, dtype=np.float32) / float(smooth_k)
+
+    pts = []
+
+    for theta in np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False):
+        dx = float(np.cos(theta))
+        dy = float(np.sin(theta))
+
+        # Max radius until image boundary
+        r_candidates = []
+        if abs(dx) > 1e-6:
+            r_candidates.append((0.0 - cx) / dx)
+            r_candidates.append(((w - 1.0) - cx) / dx)
+        if abs(dy) > 1e-6:
+            r_candidates.append((0.0 - cy) / dy)
+            r_candidates.append(((h - 1.0) - cy) / dy)
+
+        r_candidates = [rr for rr in r_candidates if rr > 0]
+        if not r_candidates:
+            continue
+        rmax = min(r_candidates)
+        if rmax < 5:
+            continue
+
+        # Search window around guessed radius
+        r_start = int(max(5, 0.55 * r_guess))
+        r_end = int(min(rmax - 2, 1.25 * r_guess))
+        if r_end <= r_start + 4:
+            r_start = 1
+            r_end = int(rmax - 2)
+
+        rr = np.arange(r_start, r_end + 1, dtype=np.int32)
+        xs = np.clip(np.rint(cx + rr * dx).astype(np.int32), 0, w - 1)
+        ys = np.clip(np.rint(cy + rr * dy).astype(np.int32), 0, h - 1)
+
+        prof = g[ys, xs].astype(np.float32)
+        if prof.size < 6:
+            continue
+
+        # Smooth the profile to reduce vessel/noise spikes
+        prof_s = np.convolve(prof, kernel, mode="same")
+
+        # We want the strongest OUTWARD drop: inside(bright) -> outside(dark)
+        drops = prof_s[:-1] - prof_s[1:]  # positive when going darker
+        idx = int(np.argmax(drops))
+        r_edge = int(rr[idx])
+
+        x = int(np.clip(round(cx + r_edge * dx), 0, w - 1))
+        y = int(np.clip(round(cy + r_edge * dy), 0, h - 1))
+        pts.append([x, y])
+
+    if len(pts) < 5:
+        return np.zeros_like(m, dtype=np.uint8), False, "radial:too_few_points"
+
+    pts_np = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+    (ecx, ecy), (MA, ma), angle = cv.fitEllipse(pts_np)
+
+    rx = max(1, int(round((MA * 0.5) * scale)))
+    ry = max(1, int(round((ma * 0.5) * scale)))
+
+    out = np.zeros((h, w), dtype=np.uint8)
+    cv.ellipse(
+        out,
+        (int(round(ecx)), int(round(ecy))),
+        (rx, ry),
+        angle,
+        0,
+        360,
+        255,
+        thickness=cv.FILLED,
+    )
+    return out, True, "radial:edge_drop_fitEllipse"
+
+
 
 def compute_fov_mask(
     img_or_path: Union[str, Array],
@@ -353,10 +466,21 @@ def compute_fov_mask(
         need, why = _should_use_ellipse(hull, min_fill_ratio=ellipse_min_fill_ratio)
         ellipse_reason = why
         if need:
-            ellipse_mask, ellipse_used, _ = _fit_ellipse_mask_from_contour(hull, scale=ellipse_scale)
-            final = ellipse_mask
+            # NEW: fit from real image boundary (robust to the 'chord' failure)
+            ellipse_mask, ellipse_used, fit_why = _fit_ellipse_mask_from_radial_edges(
+                g, hull, scale=ellipse_scale
+            )
+            if ellipse_used:
+                ellipse_reason = f"{why} | {fit_why}"
+                final = ellipse_mask
+            else:
+                # Fallback to old behavior
+                ellipse_mask, ellipse_used, fit_why = _fit_ellipse_mask_from_contour(hull, scale=ellipse_scale)
+                ellipse_reason = f"{why} | fallback:{fit_why}"
+                final = ellipse_mask if ellipse_used else hull
         else:
             final = hull
+
     else:  # "off"
         final = hull
 
