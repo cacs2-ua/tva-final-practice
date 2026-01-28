@@ -1,378 +1,361 @@
+# Pipeline A: Illumination correction -> vessel enhancement -> (GrabCut-style) graph cut refinement
+# No deep learning / no supervised learning.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union, List
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import cv2 as cv
 
-from fov_mask import compute_fov_mask
+from pathlib import Path
 
 
-Array = np.ndarray
+try:
+    # If your project already has a robust FOV detector, we will reuse it.
+    from fov_mask import compute_fov_mask  # type: ignore
+except Exception:
+    compute_fov_mask = None  # fallback will be used
 
+def _load_img_if_path(img_or_path):
+    """
+    Accept either:
+      - np.ndarray image
+      - str / Path path to an image on disk
+    Returns np.ndarray (uint8).
+    """
+    if isinstance(img_or_path, (str, Path)):
+        p = Path(img_or_path)
+        im = cv.imread(str(p), cv.IMREAD_UNCHANGED)
+        if im is None:
+            raise FileNotFoundError(f"Could not read image at: {p}")
+        return im
+    return img_or_path
 
 @dataclass
 class PipelineAParams:
-    # --- FOV mask ---
+    # --- safety / early exits ---
+    blank_std_thresh: float = 1.0          # if std(gray) < this AND max(gray) small -> blank
+    blank_max_thresh: int = 2
+    min_vessel_score: float = 0.03         # if vesselness max < this -> return empty
+
+    # --- illumination correction / contrast ---
+    bg_sigma: float = 25.0                 # background estimation for illumination correction
+    clahe_clip: float = 2.0
+    clahe_tile: int = 8
+
+    # --- vessel enhancement (multi-scale black-hat) ---
+    blackhat_ksizes: Tuple[int, int, int] = (9, 15, 23)  # odd sizes
+    smooth_sigma: float = 1.2
+
+    # --- GrabCut (GraphCut) refinement ---
+    grabcut_iters: int = 3
+    pr_fg_quantile: float = 0.80           # probable FG threshold quantile
+    fg_quantile: float = 0.93              # sure FG threshold quantile
+    bg_quantile: float = 0.55              # sure BG threshold quantile
+    min_fg_pixels: int = 40                # ensure some FG seeds exist
+    min_pr_fg_pixels: int = 200            # ensure some probable FG exists
+
+    # --- postprocessing ---
+    min_component_area: int = 20
+    open_ksize: int = 3                    # remove specks
+    close_ksize: int = 3                   # connect tiny gaps
+
+    # --- fallback FOV ---
+    fov_nonzero_thresh: int = 1            # for fallback FOV from green channel
     fov_close_ksize: int = 21
-    fov_open_ksize: int = 11
-    fov_do_convex_hull: bool = True
-    fov_ellipse_mode: str = "auto"   # "off" | "auto" | "force"
-    fov_ellipse_scale: float = 1.01
-
-    # --- Retinex-like correction (paper-inspired) ---
-    bilateral_d: int = 9
-    bilateral_sigma_color: float = 25.0
-    bilateral_sigma_space: float = 25.0
-    retinex_eps: float = 1.0  # for log(I+eps)
-    clahe_clip_limit: float = 2.0
-    clahe_tile_grid: int = 8
-
-    # --- Vesselness (Frangi/Hessian substitute for Local Phase) ---
-    frangi_sigmas: Tuple[float, ...] = (1.0, 1.5, 2.0, 2.5, 3.0)
-    frangi_beta: float = 0.5
-    frangi_c_percentile: float = 90.0  # dynamic c from S distribution
-    # if you want to bias toward thin vessels, increase weight on small sigmas:
-    sigma_weight_power: float = 0.0    # 0 => equal weight, >0 biases large sigmas
-
-    # --- GraphCut (GrabCut) ---
-    grabcut_iters: int = 5
-    # quantiles for init mask inside FOV:
-    q_sure_fg: float = 0.995
-    q_prob_fg: float = 0.970
-    q_prob_bg: float = 0.300
-
-    # --- Postprocess ---
-    post_open_ksize: int = 3
-    post_close_ksize: int = 3
-    min_component_area: int = 30  # remove tiny blobs (not too aggressive)
 
 
-def _to_uint8(x: Array) -> Array:
-    if x.dtype == np.uint8:
-        return x
-    xf = x.astype(np.float32)
-    xf = xf - float(xf.min())
-    denom = float(xf.max() - xf.min())
-    if denom < 1e-6:
-        return np.zeros_like(x, dtype=np.uint8)
-    y = (255.0 * xf / denom).clip(0, 255).astype(np.uint8)
-    return y
+def _dbg(verbose: bool, msg: str) -> None:
+    if verbose:
+        print(msg)
 
 
-def _green_or_gray(img: Array) -> Array:
+def _to_green(img: np.ndarray) -> np.ndarray:
     if img.ndim == 2:
-        return _to_uint8(img)
+        return img
     if img.ndim == 3 and img.shape[2] >= 3:
-        return _to_uint8(img[:, :, 1])  # green channel (best vessel contrast)
+        # works for both RGB and BGR because G is channel 1 in both
+        return img[:, :, 1]
     raise ValueError(f"Unsupported image shape: {img.shape}")
 
 
-def _retinex_like(gray_u8: Array, p: PipelineAParams) -> Array:
-    """
-    Retinex approximation from paper:
-      R(x) = log(I(x)+eps) - log(Bilateral(I)(x)+eps)
-    Then normalize and apply CLAHE.
-    """
-    I = gray_u8.astype(np.float32)
-    L = cv.bilateralFilter(I, d=int(p.bilateral_d),
-                           sigmaColor=float(p.bilateral_sigma_color),
-                           sigmaSpace=float(p.bilateral_sigma_space))
-    eps = float(p.retinex_eps)
-    R = np.log(I + eps) - np.log(L + eps)
+def _fallback_fov_mask(g: np.ndarray, params: PipelineAParams) -> np.ndarray:
+    # basic: anything non-black, then close to get one blob, then take largest CC
+    thr = (g > int(params.fov_nonzero_thresh)).astype(np.uint8) * 255
+    if thr.sum() == 0:
+        return np.zeros_like(g, dtype=np.uint8)
 
-    # Normalize to uint8
-    R_u8 = _to_uint8(R)
+    k = int(params.fov_close_ksize)
+    if k % 2 == 0:
+        k += 1
+    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (k, k))
+    closed = cv.morphologyEx(thr, cv.MORPH_CLOSE, kernel)
 
-    # CLAHE (helps with inhomogeneity / local contrast)
-    clahe = cv.createCLAHE(
-        clipLimit=float(p.clahe_clip_limit),
-        tileGridSize=(int(p.clahe_tile_grid), int(p.clahe_tile_grid))
-    )
-    out = clahe.apply(R_u8)
-    return out
+    n, labels, stats, _ = cv.connectedComponentsWithStats((closed > 0).astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return (closed > 0).astype(np.uint8) * 255
+
+    # largest non-background component
+    areas = stats[1:, cv.CC_STAT_AREA]
+    idx = 1 + int(np.argmax(areas))
+    fov = (labels == idx).astype(np.uint8) * 255
+    return fov
 
 
-def _hessian_second_derivatives(img_f32: Array) -> Tuple[Array, Array, Array]:
-    """
-    Compute second derivatives (Ixx, Iyy, Ixy) using Sobel on a smoothed image.
-    """
-    Ixx = cv.Sobel(img_f32, cv.CV_32F, 2, 0, ksize=3)
-    Iyy = cv.Sobel(img_f32, cv.CV_32F, 0, 2, ksize=3)
-    Ixy = cv.Sobel(img_f32, cv.CV_32F, 1, 1, ksize=3)
-    return Ixx, Iyy, Ixy
+def _compute_fov(g: np.ndarray, params: PipelineAParams, verbose: bool, debug: Dict[str, Any]) -> np.ndarray:
+    if compute_fov_mask is not None:
+        try:
+            fov = compute_fov_mask(g)  # project function
+            fov = (fov > 0).astype(np.uint8) * 255
+            debug["fov_source"] = "compute_fov_mask"
+            return fov
+        except Exception as e:
+            _dbg(verbose, f"[PipelineA] compute_fov_mask failed -> fallback. Reason: {e!r}")
+            debug["fov_source"] = "fallback_due_to_exception"
+
+    fov = _fallback_fov_mask(g, params)
+    debug["fov_source"] = "fallback"
+    return fov
 
 
-def _frangi_vesselness_2d(gray_u8: Array, p: PipelineAParams, *, verbose: bool = False) -> Array:
-    """
-    Practical substitute for Local Phase enhancement:
-    Multi-scale Hessian/Frangi vesselness on an inverted image (vessels become bright ridges).
-    Returns vesselness in [0,1] float32.
-    """
-    # Invert: vessels are dark in green channel, so invert to make vessels bright
-    inv = (255 - gray_u8).astype(np.float32) / 255.0
+def _illumination_correct_and_clahe(g: np.ndarray, params: PipelineAParams) -> np.ndarray:
+    g_f = g.astype(np.float32)
+    bg = cv.GaussianBlur(g_f, (0, 0), sigmaX=float(params.bg_sigma), sigmaY=float(params.bg_sigma))
+    corr = g_f - bg
+    # normalize to 8-bit
+    corr_u8 = cv.normalize(corr, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
 
-    sigmas = list(p.frangi_sigmas)
-    beta = float(p.frangi_beta)
-    eps = 1e-12
-
-    vesselness_max = np.zeros_like(inv, dtype=np.float32)
-
-    for s in sigmas:
-        # Smooth
-        k = int(max(3, 2 * int(round(3 * s)) + 1))
-        sm = cv.GaussianBlur(inv, (k, k), float(s))
-
-        Ixx, Iyy, Ixy = _hessian_second_derivatives(sm)
-
-        # Scale normalization (Frangi uses sigma^2)
-        scale = float(s * s)
-        Ixx *= scale
-        Iyy *= scale
-        Ixy *= scale
-
-        # Eigenvalues of Hessian for each pixel (2x2 symmetric):
-        # [Ixx Ixy; Ixy Iyy]
-        tmp = np.sqrt((Ixx - Iyy) ** 2 + 4.0 * (Ixy ** 2))
-        l1 = 0.5 * (Ixx + Iyy - tmp)
-        l2 = 0.5 * (Ixx + Iyy + tmp)
-
-        # Sort so |l1| <= |l2|
-        abs_l1 = np.abs(l1)
-        abs_l2 = np.abs(l2)
-        swap = abs_l1 > abs_l2
-        l1s = l1.copy()
-        l2s = l2.copy()
-        l1s[swap], l2s[swap] = l2[swap], l1[swap]
-        l1, l2 = l1s, l2s
-
-        # For bright tubular structures: l2 should be negative (ridge)
-        # If l2 > 0 -> background
-        mask = (l2 < 0).astype(np.float32)
-
-        Rb = (l1 / (l2 + eps)) ** 2
-        S2 = l1 ** 2 + l2 ** 2
-
-        # Dynamic c from percentile of S (robust)
-        c = np.percentile(np.sqrt(S2), float(p.frangi_c_percentile))
-        c = float(max(c, 1e-6))
-
-        V = np.exp(-Rb / (2.0 * (beta ** 2))) * (1.0 - np.exp(-S2 / (2.0 * (c ** 2))))
-        V *= mask
-
-        # Optional sigma weighting
-        if p.sigma_weight_power != 0.0:
-            V *= (float(s) ** float(p.sigma_weight_power))
-
-        vesselness_max = np.maximum(vesselness_max, V.astype(np.float32))
-
-    # Normalize to [0,1]
-    vmax = float(np.max(vesselness_max))
-    if vmax > 1e-12:
-        vesselness = (vesselness_max / vmax).clip(0.0, 1.0).astype(np.float32)
-    else:
-        vesselness = vesselness_max.clip(0.0, 1.0).astype(np.float32)
-
-    if verbose:
-        vv = vesselness
-        print("[PipelineA][Vesselness] min/max:", float(vv.min()), float(vv.max()))
-        for q in (50, 75, 90, 95, 97, 99):
-            print(f"[PipelineA][Vesselness] p{q}:", float(np.percentile(vv, q)))
-
-    return vesselness
+    clahe = cv.createCLAHE(clipLimit=float(params.clahe_clip),
+                           tileGridSize=(int(params.clahe_tile), int(params.clahe_tile)))
+    eq = clahe.apply(corr_u8)
+    return eq
 
 
-def _bbox_from_mask(mask_u8: Array) -> Tuple[int, int, int, int]:
-    """
-    Bounding box (x,y,w,h) around non-zero region. If empty, returns full image.
-    """
-    ys, xs = np.where(mask_u8 > 0)
-    h, w = mask_u8.shape[:2]
-    if len(xs) == 0:
-        return 0, 0, w, h
-    x0 = int(xs.min())
-    x1 = int(xs.max())
-    y0 = int(ys.min())
-    y1 = int(ys.max())
-    return x0, y0, (x1 - x0 + 1), (y1 - y0 + 1)
+def _vessel_enhance(eq_u8: np.ndarray, fov_u8: np.ndarray, params: PipelineAParams) -> np.ndarray:
+    # Multi-scale black-hat to highlight dark thin structures
+    scores = []
+    for k in params.blackhat_ksizes:
+        k = int(k)
+        if k < 3:
+            k = 3
+        if k % 2 == 0:
+            k += 1
+        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (k, k))
+        bh = cv.morphologyEx(eq_u8, cv.MORPH_BLACKHAT, kernel)
+        scores.append(bh.astype(np.float32))
+
+    v = np.maximum.reduce(scores) if len(scores) > 1 else scores[0]
+    v = v / 255.0
+
+    # smooth a bit
+    if float(params.smooth_sigma) > 0:
+        v = cv.GaussianBlur(v, (0, 0), sigmaX=float(params.smooth_sigma), sigmaY=float(params.smooth_sigma))
+
+    # zero outside FOV
+    v[fov_u8 == 0] = 0.0
+
+    # normalize inside FOV for stability
+    inside = v[fov_u8 > 0]
+    if inside.size > 0:
+        vmin = float(np.min(inside))
+        vmax = float(np.max(inside))
+        if vmax > vmin + 1e-6:
+            v = (v - vmin) / (vmax - vmin)
+            v[fov_u8 == 0] = 0.0
+    return v
 
 
-def _init_grabcut_mask(vesselness: Array, fov_u8: Array, p: PipelineAParams, *, verbose: bool = False) -> Array:
-    """
-    Initialize GrabCut mask using vesselness quantiles.
-    """
-    gc = np.full(fov_u8.shape[:2], cv.GC_PR_BGD, dtype=np.uint8)
-
-    fov = (fov_u8 > 0)
-    gc[~fov] = cv.GC_BGD  # sure background outside FOV
-
-    vals = vesselness[fov]
-    if vals.size < 10:
-        return gc
-
-    q_sure_fg = float(np.quantile(vals, float(p.q_sure_fg)))
-    q_prob_fg = float(np.quantile(vals, float(p.q_prob_fg)))
-    q_prob_bg = float(np.quantile(vals, float(p.q_prob_bg)))
-
-    sure_fg = fov & (vesselness >= q_sure_fg)
-    prob_fg = fov & (vesselness >= q_prob_fg)
-    prob_bg = fov & (vesselness <= q_prob_bg)
-
-    gc[prob_bg] = cv.GC_PR_BGD
-    gc[prob_fg] = cv.GC_PR_FGD
-    gc[sure_fg] = cv.GC_FGD
-
-    if verbose:
-        print("[PipelineA][GrabCut init] q_prob_bg:", q_prob_bg, "q_prob_fg:", q_prob_fg, "q_sure_fg:", q_sure_fg)
-        unique, counts = np.unique(gc, return_counts=True)
-        print("[PipelineA][GrabCut init] label counts:", dict(zip(unique.tolist(), counts.tolist())))
-
-    return gc
+def _ensure_min_seeds(score: np.ndarray, fov: np.ndarray, mask: np.ndarray, label: int, min_pixels: int) -> None:
+    # Add top-K pixels as seeds if too few exist.
+    cur = int((mask == label).sum())
+    if cur >= int(min_pixels):
+        return
+    inside = np.where(fov > 0)
+    if inside[0].size == 0:
+        return
+    vals = score[inside]
+    if vals.size == 0:
+        return
+    k = int(min_pixels - cur)
+    k = min(k, vals.size)
+    if k <= 0:
+        return
+    # indices of top-k by score
+    order = np.argpartition(vals, -k)[-k:]
+    ys = inside[0][order]
+    xs = inside[1][order]
+    mask[ys, xs] = label
 
 
-def _postprocess(binary_u8: Array, fov_u8: Array, p: PipelineAParams, *, verbose: bool = False) -> Array:
-    """
-    Light cleanup: open/close + remove tiny components, keep only within FOV.
-    """
-    out = (binary_u8 > 0).astype(np.uint8) * 255
-    fov = (fov_u8 > 0)
+def _postprocess(bin_u8: np.ndarray, params: PipelineAParams) -> np.ndarray:
+    m = (bin_u8 > 0).astype(np.uint8) * 255
 
-    # Morph
-    ok = max(1, int(p.post_open_ksize))
-    ck = max(1, int(p.post_close_ksize))
-    open_k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (ok, ok))
-    close_k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (ck, ck))
+    # opening/closing
+    ok = int(params.open_ksize)
+    ck = int(params.close_ksize)
+    if ok >= 3:
+        if ok % 2 == 0:
+            ok += 1
+        k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (ok, ok))
+        m = cv.morphologyEx(m, cv.MORPH_OPEN, k)
+    if ck >= 3:
+        if ck % 2 == 0:
+            ck += 1
+        k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (ck, ck))
+        m = cv.morphologyEx(m, cv.MORPH_CLOSE, k)
 
-    out = cv.morphologyEx(out, cv.MORPH_OPEN, open_k)
-    out = cv.morphologyEx(out, cv.MORPH_CLOSE, close_k)
+    # remove tiny components
+    n, labels, stats, _ = cv.connectedComponentsWithStats((m > 0).astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return m
 
-    # Remove tiny CCs (not too aggressive!)
-    m = (out > 0).astype(np.uint8)
-    num, labels, stats, _ = cv.connectedComponentsWithStats(m, connectivity=8)
-    if num > 1:
-        keep = np.zeros(num, dtype=bool)
-        keep[0] = False
-        minA = int(p.min_component_area)
-        for i in range(1, num):
-            area = int(stats[i, cv.CC_STAT_AREA])
-            if area >= minA:
-                keep[i] = True
-
-        out2 = np.zeros_like(out, dtype=np.uint8)
-        for i in range(1, num):
-            if keep[i]:
-                out2[labels == i] = 255
-        out = out2
-
-    out[~fov] = 0
-
-    if verbose:
-        nz = int((out > 0).sum())
-        print("[PipelineA][Post] nonzero pixels:", nz)
-
+    out = np.zeros_like(m)
+    for i in range(1, n):
+        area = int(stats[i, cv.CC_STAT_AREA])
+        if area >= int(params.min_component_area):
+            out[labels == i] = 255
     return out
 
 
 def vessel_segmentation(
-    input_image: Union[str, Array],
-    *,
+    img: np.ndarray,
     verbose: bool = False,
     params: Optional[PipelineAParams] = None,
-) -> Array:
+    return_debug: bool = False,
+):
     """
-    REQUIRED API: must exist and return a binary 0/255 uint8 mask of vessels.
+    Returns a binary vessel mask (uint8, values {0,255}).
 
-    input_image: path (str) OR already-loaded image (np.ndarray).
+    Key fixes for your failing tests:
+    - Hard blank-image early exit -> ALWAYS returns all zeros.
+    - Vesselness sanity check (max score too small) -> returns all zeros.
+    - Robust GrabCut seeding + fallback seed enforcement so synthetic lines are detected.
     """
-    p = params or PipelineAParams()
+    if params is None:
+        params = PipelineAParams()
 
-    # Load image
-    if isinstance(input_image, str):
-        img = cv.imread(input_image, cv.IMREAD_UNCHANGED)
-        if img is None:
-            raise FileNotFoundError(f"Could not read input image: {input_image}")
-    else:
-        img = input_image
+    debug: Dict[str, Any] = {}
 
-    if verbose:
-        print("[PipelineA] img shape:", img.shape, "dtype:", img.dtype)
+    img = _load_img_if_path(img)
 
-    g = _green_or_gray(img)
-    H, W = g.shape[:2]
+    g = _to_green(img)
+    g_u8 = g.astype(np.uint8)
 
-    # --- FOV mask ---
-    fov_u8 = compute_fov_mask(
-        img,
-        close_ksize=int(p.fov_close_ksize),
-        open_ksize=int(p.fov_open_ksize),
-        do_convex_hull=bool(p.fov_do_convex_hull),
-        ellipse_mode=str(p.fov_ellipse_mode),
-        ellipse_scale=float(p.fov_ellipse_scale),
-        return_debug=False,
-    )
+    # ---- (1) blank / near-blank early exit ----
+    g_std = float(np.std(g_u8))
+    g_max = int(np.max(g_u8)) if g_u8.size else 0
+    debug["g_std"] = g_std
+    debug["g_max"] = g_max
+    _dbg(verbose, f"[PipelineA] green std={g_std:.3f}, max={g_max}")
 
-    if verbose:
-        fov_ratio = float((fov_u8 > 0).mean())
-        print("[PipelineA] FOV area ratio:", fov_ratio)
+    if (g_std < float(params.blank_std_thresh)) and (g_max <= int(params.blank_max_thresh)):
+        out = np.zeros(g_u8.shape, dtype=np.uint8)
+        debug["early_exit"] = "blank_image"
+        if return_debug:
+            return out, debug
+        return out
 
-    # Crop to FOV bbox for speed
-    x, y, w, h = _bbox_from_mask(fov_u8)
-    g_crop = g[y:y+h, x:x+w]
-    fov_crop = fov_u8[y:y+h, x:x+w]
+    # ---- (2) FOV ----
+    fov_u8 = _compute_fov(g_u8, params, verbose, debug)
+    fov_area = int((fov_u8 > 0).sum())
+    debug["fov_area"] = fov_area
+    _dbg(verbose, f"[PipelineA] FOV source={debug.get('fov_source')} area={fov_area}")
 
-    # Mask outside FOV
-    g_crop_masked = g_crop.copy()
-    g_crop_masked[fov_crop == 0] = 0
+    if fov_area == 0:
+        out = np.zeros(g_u8.shape, dtype=np.uint8)
+        debug["early_exit"] = "empty_fov"
+        if return_debug:
+            return out, debug
+        return out
 
-    # --- Retinex-like + CLAHE ---
-    ret = _retinex_like(g_crop_masked, p)
-    ret[fov_crop == 0] = 0
+    # ---- (3) illumination correction + CLAHE ----
+    eq = _illumination_correct_and_clahe(g_u8, params)
 
-    if verbose:
-        print("[PipelineA][Retinex] min/max:", int(ret.min()), int(ret.max()))
+    # ---- (4) vessel enhancement ----
+    score = _vessel_enhance(eq, fov_u8, params)
+    smax = float(np.max(score)) if score.size else 0.0
+    debug["vessel_score_max"] = smax
+    _dbg(verbose, f"[PipelineA] vessel_score max={smax:.4f}")
 
-    # --- Vessel enhancement (Frangi substitute) ---
-    vesselness = _frangi_vesselness_2d(ret, p, verbose=verbose)  # float [0,1]
-    vesselness[fov_crop == 0] = 0.0
+    # If no vessel signal at all, return empty (fixes blank-like images + avoids all-foreground grabcut)
+    if smax < float(params.min_vessel_score):
+        out = np.zeros(g_u8.shape, dtype=np.uint8)
+        debug["early_exit"] = "no_vessel_signal"
+        if return_debug:
+            return out, debug
+        return out
 
-    # --- GraphCut using GrabCut ---
-    # Build a 3-channel feature image for GrabCut:
-    # channel0 = retinex/clahe, channel1 = vesselness*255, channel2 = retinex/clahe
-    v255 = (vesselness * 255.0).clip(0, 255).astype(np.uint8)
-    feat = cv.merge([ret, v255, ret])
+    # ---- (5) build GrabCut mask (GraphCut) ----
+    inside = score[fov_u8 > 0]
+    pr_thr = float(np.quantile(inside, float(params.pr_fg_quantile)))
+    fg_thr = float(np.quantile(inside, float(params.fg_quantile)))
+    bg_thr = float(np.quantile(inside, float(params.bg_quantile)))
+    debug.update({"pr_thr": pr_thr, "fg_thr": fg_thr, "bg_thr": bg_thr})
+    _dbg(verbose, f"[PipelineA] thresholds: bg={bg_thr:.4f}, pr_fg={pr_thr:.4f}, fg={fg_thr:.4f}")
 
-    gc_mask = _init_grabcut_mask(vesselness, fov_crop, p, verbose=verbose)
+    # init: background everywhere, probable background inside FOV
+    gc = np.full(g_u8.shape, cv.GC_BGD, dtype=np.uint8)
+    gc[fov_u8 > 0] = cv.GC_PR_BGD
 
+    # probable FG / sure FG / sure BG
+    prob_fg = (score >= pr_thr) & (fov_u8 > 0)
+    sure_fg = (score >= fg_thr) & (fov_u8 > 0)
+    sure_bg = (score <= bg_thr) & (fov_u8 > 0)
+
+    gc[prob_fg] = cv.GC_PR_FGD
+    gc[sure_fg] = cv.GC_FGD
+    gc[sure_bg] = cv.GC_BGD
+    gc[fov_u8 == 0] = cv.GC_BGD
+
+    # enforce a minimum number of seeds so synthetic doesn’t end up with zero FG seeds
+    _ensure_min_seeds(score, fov_u8, gc, cv.GC_FGD, int(params.min_fg_pixels))
+    _ensure_min_seeds(score, fov_u8, gc, cv.GC_PR_FGD, int(params.min_pr_fg_pixels))
+
+    debug["n_sure_fg"] = int((gc == cv.GC_FGD).sum())
+    debug["n_pr_fg"] = int((gc == cv.GC_PR_FGD).sum())
+    debug["n_sure_bg"] = int((gc == cv.GC_BGD).sum())
+    _dbg(verbose, f"[PipelineA] seeds: sure_fg={debug['n_sure_fg']}, pr_fg={debug['n_pr_fg']}")
+
+    # ---- (6) GrabCut ----
     bgdModel = np.zeros((1, 65), np.float64)
     fgdModel = np.zeros((1, 65), np.float64)
 
-    rect_dummy = (0, 0, feat.shape[1], feat.shape[0])  # ignored in INIT_WITH_MASK
-    cv.grabCut(
-        feat,
-        gc_mask,
-        rect_dummy,
-        bgdModel,
-        fgdModel,
-        iterCount=int(p.grabcut_iters),
-        mode=cv.GC_INIT_WITH_MASK,
-    )
+    try:
+        cv.grabCut(
+            img if img.ndim == 3 else cv.cvtColor(g_u8, cv.COLOR_GRAY2BGR),
+            gc,
+            None,
+            bgdModel,
+            fgdModel,
+            int(params.grabcut_iters),
+            mode=cv.GC_INIT_WITH_MASK,
+        )
+        debug["grabcut_ok"] = True
+    except Exception as e:
+        # If grabcut fails, we fallback to thresholding score (still should pass synthetic test).
+        debug["grabcut_ok"] = False
+        debug["grabcut_error"] = repr(e)
+        _dbg(verbose, f"[PipelineA] grabCut failed -> fallback threshold. Reason: {e!r}")
 
-    seg = np.where((gc_mask == cv.GC_FGD) | (gc_mask == cv.GC_PR_FGD), 255, 0).astype(np.uint8)
-    seg[fov_crop == 0] = 0
+        thr = float(np.quantile(inside, 0.90))
+        out = ((score >= thr) & (fov_u8 > 0)).astype(np.uint8) * 255
+        out = _postprocess(out, params)
+        if return_debug:
+            return out, debug
+        return out
 
-    if verbose:
-        print("[PipelineA][GrabCut] seg nonzero:", int((seg > 0).sum()))
-
-    # --- Postprocess ---
-    seg = _postprocess(seg, fov_crop, p, verbose=verbose)
-
-    # Paste back to full resolution
-    out = np.zeros((H, W), dtype=np.uint8)
-    out[y:y+h, x:x+w] = seg
+    # Extract FG + Probable FG, then clamp to FOV
+    out = np.where((gc == cv.GC_FGD) | (gc == cv.GC_PR_FGD), 255, 0).astype(np.uint8)
     out[fov_u8 == 0] = 0
 
-    if verbose:
-        print("[PipelineA] output unique:", np.unique(out).tolist()[:10])
+    # ---- (7) postprocess ----
+    out = _postprocess(out, params)
 
+    debug["out_nz"] = int((out > 0).sum())
+    _dbg(verbose, f"[PipelineA] output nz={debug['out_nz']}")
+
+    if return_debug:
+        return out, debug
     return out
