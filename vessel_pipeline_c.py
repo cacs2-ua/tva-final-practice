@@ -48,6 +48,38 @@ def _ensure_odd(k: int) -> int:
         k += 1
     return k
 
+def _remove_small_components(mask_01: Array, min_area: int) -> Tuple[Array, Dict[str, Any]]:
+    """
+    Keep only connected components with area >= min_area.
+    Input: 0/1 uint8.
+    Output: 0/1 uint8.
+    """
+    m = (mask_01 > 0).astype(np.uint8)
+    num, labels, stats, _ = cv.connectedComponentsWithStats(m, connectivity=8)
+
+    kept = np.zeros_like(m, dtype=np.uint8)
+    kept_count = 0
+    removed_count = 0
+    areas_kept = []
+
+    for i in range(1, num):
+        area = int(stats[i, cv.CC_STAT_AREA])
+        if area >= int(min_area):
+            kept[labels == i] = 1
+            kept_count += 1
+            areas_kept.append(area)
+        else:
+            removed_count += 1
+
+    info = {
+        "cc_total": int(num - 1),
+        "cc_kept": int(kept_count),
+        "cc_removed": int(removed_count),
+        "min_area": int(min_area),
+        "areas_kept_min": int(min(areas_kept)) if areas_kept else 0,
+        "areas_kept_max": int(max(areas_kept)) if areas_kept else 0,
+    }
+    return kept, info
 
 def _line_se(length: int, angle_deg: float, thickness: int = 1) -> Array:
     """
@@ -108,39 +140,117 @@ def _otsu_threshold_from_values(values_uint8: Array) -> int:
 
     return int(thr)
 
-
-def _remove_small_components(mask_01: Array, min_area: int) -> Tuple[Array, Dict[str, Any]]:
+def _percentile_threshold_from_values(values_uint8: Array, target_fg_frac: float) -> int:
     """
-    Keep only connected components with area >= min_area.
-    Input: 0/1 uint8.
-    Output: 0/1 uint8.
+    Pick a threshold so that roughly `target_fg_frac` of pixels are >= thr.
+    (Unsupervised, robust when Otsu is unstable on some images.)
     """
-    m = (mask_01 > 0).astype(np.uint8)
-    num, labels, stats, _ = cv.connectedComponentsWithStats(m, connectivity=8)
-    kept = np.zeros_like(m, dtype=np.uint8)
+    v = values_uint8.reshape(-1).astype(np.uint8)
+    if v.size == 0:
+        return 128
+    t = float(np.clip(float(target_fg_frac), 0.001, 0.499))
+    q = np.percentile(v, 100.0 * (1.0 - t))
+    return int(np.clip(int(round(q)), 0, 255))
 
-    kept_count = 0
-    removed_count = 0
-    areas_kept = []
+def _quick_cleanup_and_stats(
+    binary01: Array,
+    fov01: Array,
+    morph_open_ksize: int,
+    morph_close_ksize: int,
+    min_cc_area: int,
+) -> Tuple[float, int]:
+    """
+    Fast approximation of your final cleanup to guide auto-thresholding.
+    Returns (fg_frac_inside_fov, cc_total_after_small_cc_removal).
+    """
+    m = (binary01 > 0).astype(np.uint8)
+    m[fov01 == 0] = 0
 
-    for i in range(1, num):
-        area = int(stats[i, cv.CC_STAT_AREA])
-        if area >= int(min_area):
-            kept[labels == i] = 1
-            kept_count += 1
-            areas_kept.append(area)
-        else:
-            removed_count += 1
+    ok_open = _ensure_odd(morph_open_ksize)
+    ok_close = _ensure_odd(morph_close_ksize)
+    k_open = cv.getStructuringElement(cv.MORPH_ELLIPSE, (ok_open, ok_open))
+    k_close = cv.getStructuringElement(cv.MORPH_ELLIPSE, (ok_close, ok_close))
 
-    info = {
-        "cc_total": int(num - 1),
-        "cc_kept": int(kept_count),
-        "cc_removed": int(removed_count),
-        "min_area": int(min_area),
-        "areas_kept_min": int(min(areas_kept)) if areas_kept else 0,
-        "areas_kept_max": int(max(areas_kept)) if areas_kept else 0,
-    }
-    return kept, info
+    m255 = (m * 255).astype(np.uint8)
+    m255 = cv.morphologyEx(m255, cv.MORPH_OPEN, k_open)
+    m255 = cv.morphologyEx(m255, cv.MORPH_CLOSE, k_close)
+    m_clean = (m255 > 0).astype(np.uint8)
+
+    m_clean, cc_info = _remove_small_components(m_clean, min_area=int(min_cc_area))
+
+    denom = float(np.maximum(1, int(fov01.sum())))
+    fg_frac = float(m_clean.sum()) / denom
+    cc_total = int(cc_info.get("cc_total", 0))
+    return fg_frac, cc_total
+
+def _auto_select_otsu_threshold(
+    vesselness: Array,
+    fov01: Array,
+    thr_otsu: int,
+    otsu_offset: int,
+    morph_open_ksize: int,
+    morph_close_ksize: int,
+    min_cc_area: int,
+    *,
+    fg_min: float = 0.020,
+    fg_max: float = 0.180,
+    fg_target: float = 0.070,
+    sweep_min: int = -32,
+    sweep_max: int = 12,
+    sweep_step: int = 2,
+    use_percentile_fallback: bool = True,
+    verbose: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Fixes the 'single-image collapse' when Otsu+fixed offset yields an extreme fg fraction.
+    1) Start with (thr_otsu + otsu_offset)
+    2) If fg fraction is out-of-range, sweep offsets (existing hyperparameter) to hit fg_target
+    3) If still bad, fallback to percentile threshold (unsupervised)
+    Returns (thr_final, meta_dict).
+    """
+    def clip_thr(t: int) -> int:
+        return int(np.clip(int(t), 0, 255))
+
+    # initial (current behavior)
+    thr0 = clip_thr(thr_otsu + int(otsu_offset))
+    fg0, cc0 = _quick_cleanup_and_stats((vesselness >= thr0).astype(np.uint8), fov01, morph_open_ksize, morph_close_ksize, min_cc_area)
+
+    if fg_min <= fg0 <= fg_max:
+        return thr0, {"method": "otsu_fixed_offset", "thr_otsu": int(thr_otsu), "thr": int(thr0), "fg": float(fg0), "cc": int(cc0)}
+
+    # sweep offsets (TRY DIFFERENT EXISTING HYPERPARAMETER VALUES)
+    best = (abs(fg0 - fg_target) + 5e-5 * cc0, thr0, fg0, cc0, int(otsu_offset))
+
+    for off in range(int(otsu_offset) + int(sweep_min), int(otsu_offset) + int(sweep_max) + 1, int(sweep_step)):
+        thr = clip_thr(int(thr_otsu) + int(off))
+        fg, cc = _quick_cleanup_and_stats((vesselness >= thr).astype(np.uint8), fov01, morph_open_ksize, morph_close_ksize, min_cc_area)
+        score = abs(fg - fg_target) + 5e-5 * cc
+
+        if score < best[0]:
+            best = (score, thr, fg, cc, off)
+
+    _, thr_best, fg_best, cc_best, off_best = best
+
+    if fg_min <= fg_best <= fg_max:
+        if verbose:
+            print(f"[AutoThr] Otsu fixed-offset bad (fg={fg0:.4f}). Using offset sweep -> off={off_best}, thr={thr_best}, fg={fg_best:.4f}, cc={cc_best}")
+        return int(thr_best), {"method": "otsu_offset_sweep", "thr_otsu": int(thr_otsu), "thr": int(thr_best), "off": int(off_best), "fg": float(fg_best), "cc": int(cc_best)}
+
+    # fallback: percentile threshold (unsupervised)
+    if use_percentile_fallback:
+        vals = vesselness[fov01 > 0].astype(np.uint8)
+        thr_p = _percentile_threshold_from_values(vals, target_fg_frac=float(fg_target))
+        fg_p, cc_p = _quick_cleanup_and_stats((vesselness >= thr_p).astype(np.uint8), fov01, morph_open_ksize, morph_close_ksize, min_cc_area)
+
+        if verbose:
+            print(f"[AutoThr] Sweep still extreme (fg={fg_best:.4f}). Using percentile -> thr={thr_p}, fg={fg_p:.4f}, cc={cc_p}")
+
+        return int(thr_p), {"method": "percentile", "thr": int(thr_p), "fg_target": float(fg_target), "fg": float(fg_p), "cc": int(cc_p)}
+
+    # last resort: best sweep
+    if verbose:
+        print(f"[AutoThr] Using best sweep (still extreme) -> off={off_best}, thr={thr_best}, fg={fg_best:.4f}, cc={cc_best}")
+    return int(thr_best), {"method": "otsu_offset_sweep_extreme", "thr_otsu": int(thr_otsu), "thr": int(thr_best), "off": int(off_best), "fg": float(fg_best), "cc": int(cc_best)}
 
 
 def segment_vessels_pipeline_c(
@@ -220,8 +330,14 @@ def segment_vessels_pipeline_c(
     # --- CLAHE inside FOV (avoid amplifying outside background) ---
     tile = int(max(2, clahe_tile_grid_size))
     clahe = cv.createCLAHE(clipLimit=float(clahe_clip_limit), tileGridSize=(tile, tile))
-    clahe_img = clahe.apply(green)
 
+    # Fill outside-FOV with a robust inside intensity before CLAHE (prevents border artifacts)
+    inside = green[fov01 > 0]
+    fill_val = int(np.median(inside)) if inside.size else 0
+    green_filled = green.copy()
+    green_filled[fov01 == 0] = fill_val
+
+    clahe_img = clahe.apply(green_filled)
     clahe_in_fov = clahe_img.copy()
     clahe_in_fov[fov01 == 0] = 0
 
@@ -263,10 +379,21 @@ def segment_vessels_pipeline_c(
     # --- Threshold ---
     if threshold_mode == "otsu":
         vals = vesselness[fov01 > 0]
-        thr = _otsu_threshold_from_values(vals)
-        thr2 = int(np.clip(thr + int(otsu_offset), 0, 255))
-        binary01 = (vesselness >= thr2).astype(np.uint8)
-        thr_used = thr2
+        thr_otsu = _otsu_threshold_from_values(vals)
+
+        thr2, thr_meta = _auto_select_otsu_threshold(
+            vesselness=vesselness,
+            fov01=fov01,
+            thr_otsu=thr_otsu,
+            otsu_offset=otsu_offset,
+            morph_open_ksize=morph_open_ksize,
+            morph_close_ksize=morph_close_ksize,
+            min_cc_area=min_cc_area,
+            verbose=verbose,
+        )
+
+        binary01 = (vesselness >= int(thr2)).astype(np.uint8)
+        thr_used = thr_meta
     elif threshold_mode == "adaptive":
         bs = _ensure_odd(adaptive_block_size)
         thr_img = cv.adaptiveThreshold(
