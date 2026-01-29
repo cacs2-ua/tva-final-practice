@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 import cv2 as cv
@@ -43,6 +43,7 @@ def _get_green_or_gray(img: Array) -> Array:
 def _masked_otsu_threshold(values_u8: Array) -> int:
     """
     Compute Otsu threshold from a 1D uint8 array of values (already masked).
+    Robustified: caller should remove zeros/outliers if needed.
     """
     if values_u8.size == 0:
         return 128
@@ -52,8 +53,6 @@ def _masked_otsu_threshold(values_u8: Array) -> int:
     sum_total = float(np.dot(np.arange(256), hist))
     sum_b = 0.0
     w_b = 0.0
-    w_f = 0.0
-
     var_max = -1.0
     thr = 128
 
@@ -90,7 +89,6 @@ def _line_kernel(length: int, angle_deg: float) -> Array:
     k = np.zeros((length, length), dtype=np.uint8)
     c = length // 2
 
-    # Endpoint vector
     rad = np.deg2rad(angle_deg)
     dx = int(round((length // 2) * np.cos(rad)))
     dy = int(round((length // 2) * np.sin(rad)))
@@ -102,18 +100,28 @@ def _line_kernel(length: int, angle_deg: float) -> Array:
     return k
 
 
-def _retinex_bilateral(gray_u8: Array, *, d: int = 5, sigma_color: float = 35.0, sigma_space: float = 35.0) -> Array:
+def _retinex_bilateral(
+    gray_u8: Array,
+    *,
+    d: int = 5,
+    sigma_color: float = 35.0,
+    sigma_space: float = 35.0,
+) -> Array:
     """
-    Retinex-style illumination correction inspired by the paper:
+    Retinex-style illumination correction:
       R(x) = log(I+1) - log(L+1), where L is edge-preserving (bilateral) smooth.
     Output: uint8 in [0,255].
     """
     I = gray_u8.astype(np.float32)
-    L = cv.bilateralFilter(gray_u8, d=d, sigmaColor=float(sigma_color), sigmaSpace=float(sigma_space)).astype(np.float32)
+    L = cv.bilateralFilter(
+        gray_u8,
+        d=int(d),
+        sigmaColor=float(sigma_color),
+        sigmaSpace=float(sigma_space),
+    ).astype(np.float32)
 
     R = np.log1p(I) - np.log1p(L)
-    R = _to_uint8(R)
-    return R
+    return _to_uint8(R)
 
 
 def _clahe(gray_u8: Array, clip_limit: float = 2.0, tile_grid_size: Tuple[int, int] = (8, 8)) -> Array:
@@ -133,9 +141,10 @@ def _multiscale_multiorient_blackhat(
     Dark vessels on brighter background -> blackhat highlights them.
     """
     if blur_ksize and blur_ksize >= 3:
-        if blur_ksize % 2 == 0:
-            blur_ksize += 1
-        g = cv.GaussianBlur(gray_u8, (blur_ksize, blur_ksize), 0)
+        bk = int(blur_ksize)
+        if bk % 2 == 0:
+            bk += 1
+        g = cv.GaussianBlur(gray_u8, (bk, bk), 0)
     else:
         g = gray_u8
 
@@ -143,13 +152,16 @@ def _multiscale_multiorient_blackhat(
 
     for L in lengths:
         for a in angles_deg:
-            k = _line_kernel(L, a)
+            k = _line_kernel(int(L), float(a))
             bh = cv.morphologyEx(g, cv.MORPH_BLACKHAT, k)
             best = cv.max(best, bh)
 
     return best
 
 
+# -----------------------------
+# CC filtering
+# -----------------------------
 @dataclass
 class CCFilterStats:
     kept: int
@@ -180,14 +192,12 @@ def _component_shape_metrics(component_mask_u8: Array) -> Dict[str, float]:
     cnt = max(contours, key=cv.contourArea)
     per = float(cv.arcLength(cnt, True))
 
-    # circularity: 1 for circle, lower for elongated
     circ = (4.0 * np.pi * area) / (per * per + 1e-6)
 
     x, y, w, h = cv.boundingRect(cnt)
     bbox_ar = float(max(w, h)) / float(min(w, h) + 1e-6)
     extent = float(area) / float(w * h + 1e-6)
 
-    # elongation via PCA on coordinates
     ys, xs = np.where(m > 0)
     if xs.size < 5:
         elong = bbox_ar
@@ -197,7 +207,6 @@ def _component_shape_metrics(component_mask_u8: Array) -> Dict[str, float]:
         cov = (pts.T @ pts) / float(max(1, pts.shape[0] - 1))
         evals, _ = np.linalg.eigh(cov)
         evals = np.sort(evals)  # ascending
-        # major/minor axis ratio
         elong = float(np.sqrt((evals[1] + 1e-9) / (evals[0] + 1e-9)))
 
     return {
@@ -228,7 +237,7 @@ def _filter_connected_components(
       - too round/compact (blob-like): high circularity + low elongation OR high extent
     """
     m = (bin_mask_u8 > 0).astype(np.uint8)
-    num, labels, stats, _ = cv.connectedComponentsWithStats(m, connectivity=connectivity)
+    num, labels, stats, _ = cv.connectedComponentsWithStats(m, connectivity=int(connectivity))
 
     removed_reasons: Dict[str, int] = {}
     out = np.zeros_like(m, dtype=np.uint8)
@@ -245,41 +254,31 @@ def _filter_connected_components(
 
         metrics = _component_shape_metrics(cc_mask)
 
-        # Rules:
-        # 1) tiny noise
         if area < int(min_area_if_elongated):
             removed += 1
             removed_reasons["too_small_hard"] = removed_reasons.get("too_small_hard", 0) + 1
             continue
 
-        # 2) small but not elongated enough
         if area < int(min_area) and metrics["elongation"] < float(min_elongation):
             removed += 1
             removed_reasons["too_small_not_elongated"] = removed_reasons.get("too_small_not_elongated", 0) + 1
             continue
 
-        # 3) blob-like: round + not elongated
         if metrics["circularity"] > float(max_circularity) and metrics["elongation"] < float(min_elongation):
             removed += 1
             removed_reasons["too_round_compact"] = removed_reasons.get("too_round_compact", 0) + 1
             continue
 
-        # 4) very “filled” bbox -> tends to be lesions/blobs rather than line structures
         if metrics["extent"] > float(max_extent_blob) and metrics["elongation"] < float(min_elongation):
             removed += 1
             removed_reasons["high_extent_blob"] = removed_reasons.get("high_extent_blob", 0) + 1
             continue
 
-        # Keep
         out[labels == cc_id] = 1
         kept += 1
 
     out_u8 = (out * 255).astype(np.uint8)
-
-    _dbg(
-        verbose,
-        f"[CC] kept={kept} removed={removed} total={total_cc} reasons={removed_reasons}"
-    )
+    _dbg(verbose, f"[CC] kept={kept} removed={removed} total={total_cc} reasons={removed_reasons}")
 
     return out_u8, CCFilterStats(kept=kept, removed=removed, total=total_cc, removed_reasons=removed_reasons)
 
@@ -300,10 +299,12 @@ def vessel_segmentation(
     bh_lengths: Tuple[int, ...] = (9, 13, 17),
     bh_angle_step_deg: int = 15,
     bh_blur_ksize: int = 3,
+    # NEW (fix): suppress the dark FOV rim that black-hat loves to pick up
+    fov_border_margin_px: int = 10,  # typical DRIVE-safe margin (removes rim ring)
     # Binarization knobs
-    thr_offset: int = 0,  # shift Otsu a bit (+ -> stricter, - -> more vessels)
+    thr_offset: int = -5,  # more sensitive by default
     post_open_ksize: int = 3,
-    post_close_ksize: int = 3,
+    post_close_ksize: int = 5,
     # CC filter knobs (Pipeline E core)
     cc_min_area: int = 30,
     cc_min_area_if_elongated: int = 15,
@@ -313,11 +314,13 @@ def vessel_segmentation(
 ) -> Array:
     """
     Pipeline E:
-      Upstream unsupervised segmenter (Retinex-ish + multi-orient black-hat + threshold)
+      Retinex-ish + multi-orient black-hat -> threshold
       THEN Connected Components filtering as structural enforcement.
 
-    Returns:
-      segmented_image: uint8 0/255 (same HxW as input)
+    FIX (the actual bug):
+      Your pipeline was mostly detecting the DARK FOV BORDER RING (very elongated),
+      so CC-filtering kept it and IoU collapsed.
+      We suppress a border band inside the FOV (distance-to-border margin) BEFORE thresholding.
     """
     # Load
     if isinstance(input_image, str):
@@ -327,12 +330,29 @@ def vessel_segmentation(
     else:
         img = input_image
 
-    # FOV
-    fov = compute_fov_mask(img)
-    fov_bool = (fov > 0)
-    _dbg(verbose, f"[E] FOV coverage = {fov_bool.mean():.3f}")
-
     g = _get_green_or_gray(img)
+    h, w = g.shape[:2]
+
+    # FOV
+    fov = compute_fov_mask(img)  # 0/255
+    fov_bool = (fov > 0)
+
+    # Build an "inner FOV" to suppress the rim ring (distance-to-border > margin)
+    if int(fov_border_margin_px) > 0 and fov_bool.any():
+        dist = cv.distanceTransform(fov_bool.astype(np.uint8), cv.DIST_L2, 3)
+        inner_bool = dist > float(fov_border_margin_px)
+        # Fallback if margin too aggressive
+        if inner_bool.mean() < 0.10:
+            inner_bool = fov_bool
+            _dbg(verbose, f"[E] inner FOV fallback (margin too big): margin={fov_border_margin_px}")
+    else:
+        inner_bool = fov_bool
+
+    rim_band = np.logical_and(fov_bool, np.logical_not(inner_bool))
+
+    _dbg(verbose, f"[E] FOV coverage      = {fov_bool.mean():.3f}")
+    _dbg(verbose, f"[E] inner FOV coverage= {inner_bool.mean():.3f} (margin={int(fov_border_margin_px)})")
+    _dbg(verbose, f"[E] rim band coverage = {rim_band.mean():.3f}")
 
     # Retinex-style correction
     r = _retinex_bilateral(
@@ -345,9 +365,9 @@ def vessel_segmentation(
 
     # Local contrast
     c = _clahe(r, clip_limit=clahe_clip, tile_grid_size=clahe_tile)
-    _dbg(verbose, f"[E] CLAHE: min={int(c.min())} max={int(c.max())} mean={float(c.mean()):.2f}")
+    _dbg(verbose, f"[E] CLAHE:  min={int(c.min())} max={int(c.max())} mean={float(c.mean()):.2f}")
 
-    # Vesselness-ish via multiscale multi-orientation black-hat
+    # Vesselness-ish via black-hat
     angles = list(np.arange(0, 180, int(bh_angle_step_deg), dtype=np.int32).tolist())
     vesselness = _multiscale_multiorient_blackhat(
         c,
@@ -356,38 +376,56 @@ def vessel_segmentation(
         blur_ksize=int(bh_blur_ksize),
     )
 
-    # Normalize inside FOV (for stable thresholding)
-    v = vesselness.copy()
-    v[~fov_bool] = 0
+    # Suppress outside FOV + suppress rim band (THE FIX)
+    v = vesselness.astype(np.float32)
+    v[~fov_bool] = 0.0
+    v[rim_band] = 0.0
 
-    vals = v[fov_bool].astype(np.uint8)
-    thr = _masked_otsu_threshold(vals)
+    # Robust normalization inside inner FOV (avoid outliers dominating threshold)
+    vals_f = v[inner_bool]
+    if vals_f.size > 0:
+        lo = float(np.percentile(vals_f, 1.0))
+        hi = float(np.percentile(vals_f, 99.0))
+        if hi - lo < 1e-6:
+            hi = lo + 1.0
+        v = np.clip((v - lo) * (255.0 / (hi - lo)), 0.0, 255.0).astype(np.uint8)
+    else:
+        v = np.clip(v, 0.0, 255.0).astype(np.uint8)
+
+    # Threshold on INNER FOV values, excluding zeros (zeros otherwise bias Otsu)
+    vals = v[inner_bool].astype(np.uint8)
+    vals_nz = vals[vals > 0]
+    if vals_nz.size < 200:  # fallback: use all inner vals if too sparse
+        vals_nz = vals
+
+    thr = _masked_otsu_threshold(vals_nz)
     thr = int(np.clip(thr + int(thr_offset), 0, 255))
 
-    p50 = int(np.percentile(vals, 50)) if vals.size else 0
-    p90 = int(np.percentile(vals, 90)) if vals.size else 0
-    _dbg(verbose, f"[E] Vesselness: p50={p50} p90={p90} otsu_thr={thr} (offset={thr_offset})")
+    p50 = int(np.percentile(vals_nz, 50)) if vals_nz.size else 0
+    p90 = int(np.percentile(vals_nz, 90)) if vals_nz.size else 0
+    p99 = int(np.percentile(vals_nz, 99)) if vals_nz.size else 0
+    _dbg(verbose, f"[E] Vesselness(norm): p50={p50} p90={p90} p99={p99} otsu_thr={thr} (offset={thr_offset})")
 
     initial = (v > thr).astype(np.uint8) * 255
     initial[~fov_bool] = 0
+    initial[rim_band] = 0
+    _dbg(verbose, f"[E] Initial bin: fg_frac={float((initial > 0).mean()):.4f}")
 
-    _dbg(verbose, f"[E] Initial bin: fg_frac={float((initial>0).mean()):.4f}")
-
-    # Light morphology to reduce specks & reconnect micro-gaps (still upstream)
+    # Light morphology (upstream)
     if post_open_ksize and post_open_ksize >= 3:
-        k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (post_open_ksize, post_open_ksize))
+        k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (int(post_open_ksize), int(post_open_ksize)))
         initial = cv.morphologyEx(initial, cv.MORPH_OPEN, k)
 
     if post_close_ksize and post_close_ksize >= 3:
-        k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (post_close_ksize, post_close_ksize))
+        k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (int(post_close_ksize), int(post_close_ksize)))
         initial = cv.morphologyEx(initial, cv.MORPH_CLOSE, k)
 
-    _dbg(verbose, f"[E] After morph: fg_frac={float((initial>0).mean()):.4f}")
+    initial[~fov_bool] = 0
+    initial[rim_band] = 0
+    _dbg(verbose, f"[E] After morph: fg_frac={float((initial > 0).mean()):.4f}")
 
-    # -----------------------------
-    # Pipeline E KEY step: CC filtering
-    # -----------------------------
-    filtered, cc_stats = _filter_connected_components(
+    # CC filtering (core of Pipeline E)
+    filtered, _cc_stats = _filter_connected_components(
         initial,
         min_area=cc_min_area,
         min_area_if_elongated=cc_min_area_if_elongated,
@@ -398,11 +436,14 @@ def vessel_segmentation(
         verbose=verbose,
     )
 
-    # Optional final gentle reconnect (kept minimal to not bloat vessels)
-    # (If you want, you can raise post_close_ksize instead of doing more here.)
     filtered[~fov_bool] = 0
+    filtered[rim_band] = 0
     filtered = (filtered > 0).astype(np.uint8) * 255
 
-    _dbg(verbose, f"[E] Final: fg_frac={float((filtered>0).mean()):.4f} dtype={filtered.dtype} unique={np.unique(filtered)[:5]}")
+    _dbg(
+        verbose,
+        f"[E] Final: fg_frac={float((filtered>0).mean()):.4f} dtype={filtered.dtype} unique={np.unique(filtered)[:5]}"
+    )
 
     return filtered
+
