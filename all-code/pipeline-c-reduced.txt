@@ -1,109 +1,3 @@
-# Project: Retinal vessel segmentation
-
-The segmentation of retinal blood vessels from eye fundus images is of great significance for early diagnosis of eye-related diseases such as diabetes and hypertension.
-
-The goal of this project is to read an eye fundus image like the following:
-![](https://dlsi.ua.es/~pertusa/tvainput21.png)
-
-And extract the blood vessels as can be seen in the corresponding ground-truth sample:
-
-![](https://dlsi.ua.es/~pertusa/tvagt21.png)
-
-All the images for this project are extracted from the [Drive](https://drive.grand-challenge.org) dataset.
-
-For this task you can use any computer vision technique **except by deep neural networks, that are not allowed in this project**.
-
-## Implementation
-
-To begin with the project, first download from moodle the folder with all the images and upload it to google drive.
-
-Then, import the following libraries (you can add more):
-
-
-
-import os
-from google.colab import drive
-import cv2 as cv
-
-drive.mount('/content/drive')
-
-%matplotlib inline
-from matplotlib import pyplot as plt
-
-db_path =  "/content/drive/MyDrive/TVAProject"
-
-
-Now you should edit the following function to segment the image and return the obtained segmentation. This is only a simple (basic) skeleton that obviously is not performing well. Your project's goal is basically to complete this function. You can read the attached papers in Moodle to get ideas for the segmentation.
-
-
-def vessel_segmentation(input_image):
-
-    img = cv.imread(input_image, cv.IMREAD_GRAYSCALE)
-
-    # TODO: Here it goes your segmentation algorithm. A basic threholding is shown as example.
-    th, segmented_image = cv.threshold(img, 128, 255, cv.THRESH_BINARY)
-
-    return segmented_image
-
-
-
-
-
-Your project will be evaluated with the Intersection over Union (IoU) metric, commonly used in segmentation tasks. This is the function to read a ground truth image and return the IoU considering your segmented image.
-
-
-
-
-
-def single_IoU(img_name):
-
-    # Apply segmentation
-    input_img = os.path.join(db_path, 'input', img_name)
-    obtained = vessel_segmentation(input_img)
-
-    # Path of the target (ground truth) image
-    path_target = os.path.join(db_path, 'gt', img_name)
-    solution = cv.imread(path_target, cv.IMREAD_GRAYSCALE)
-
-    # Show obtained results
-    plt.imshow(obtained, cmap=plt.get_cmap('gray'))
-    plt.show()
-
-    # IoU calculation
-    intersectionAB = cv.countNonZero(obtained & solution)
-    unionAB = cv.countNonZero(obtained | solution)
-    score = intersectionAB / unionAB
-    print("Image {} - IoU={}".format(path_input, score))
-
-    return score
-
-
-
-
-
-
-This is the evaluation method that reads all the images from the input folder and gets the mean IoU for all of them. This is the score of your project, the higher the better.
-
-
-
-meanIoU=0
-
-path_input = os.path.join(db_path, 'input')
-
-# List images in input folder
-imgs = [f for f in os.listdir(path_input) if f.endswith('.png')]
-print(imgs)
-
-# For each image
-for img in imgs:
-    meanIoU += single_IoU(img)
-
-# Average
-meanIoU /= len(imgs)
-print("------------------------------------")
-print("Mean IoU={}".format(meanIoU))
-
-
 %%writefile fov_mask.py
 from __future__ import annotations
 
@@ -679,125 +573,6 @@ def compute_fov_mask(
     )
     return final, dbg
 
-%%writefile test_fov_mask.py
-import numpy as np
-import cv2 as cv
-
-from fov_mask import compute_fov_mask
-
-
-def _iou(a: np.ndarray, b: np.ndarray) -> float:
-    a = (a > 0)
-    b = (b > 0)
-    inter = np.logical_and(a, b).sum()
-    union = np.logical_or(a, b).sum()
-    return float(inter) / float(union + 1e-9)
-
-
-def test_mask_is_binary_uint8():
-    img = np.zeros((256, 256, 3), dtype=np.uint8)
-    cv.circle(img, (128, 128), 90, (40, 180, 40), thickness=-1)  # green-ish disk
-    mask = compute_fov_mask(img, do_hole_fill=True, do_convex_hull=True)
-
-    assert mask.dtype == np.uint8
-    vals = set(np.unique(mask).tolist())
-    assert vals.issubset({0, 255})
-    assert 0 in vals and 255 in vals
-
-
-def test_circle_fov_high_iou_with_noise_and_holes():
-    rng = np.random.default_rng(0)
-    h, w = 512, 512
-    img = np.zeros((h, w, 3), dtype=np.uint8)
-
-    # Ideal circle FOV
-    gt = np.zeros((h, w), dtype=np.uint8)
-    cv.circle(gt, (w // 2, h // 2), 200, 255, thickness=-1)
-
-    # Create fundus-like content inside the FOV
-    base = np.zeros((h, w), dtype=np.uint8)
-    base[gt > 0] = 150
-    noise = rng.normal(0, 12, size=(h, w)).astype(np.float32)
-    noisy = np.clip(base.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-    # Add holes inside the FOV (simulate gaps)
-    holes = gt.copy()
-    for _ in range(40):
-        x = int(rng.integers(w // 2 - 150, w // 2 + 150))
-        y = int(rng.integers(h // 2 - 150, h // 2 + 150))
-        r = int(rng.integers(6, 18))
-        cv.circle(holes, (x, y), r, 0, thickness=-1)
-
-    noisy[holes == 0] = 0
-
-    # Add random bright specks outside FOV
-    for _ in range(300):
-        x = int(rng.integers(0, w))
-        y = int(rng.integers(0, h))
-        if gt[y, x] == 0:
-            noisy[y, x] = 255
-
-    # Put into green channel (like real fundus)
-    img[:, :, 1] = noisy
-
-    mask = compute_fov_mask(
-        img,
-        blur_kind="median",
-        blur_ksize=7,
-        close_ksize=25,
-        open_ksize=9,
-        do_hole_fill=True,
-        do_convex_hull=True,
-    )
-
-    score = _iou(mask, gt)
-    assert score > 0.95, f"IoU too low: {score}"
-
-
-def test_ellipse_fov_detected():
-    rng = np.random.default_rng(1)
-    h, w = 480, 640
-    img = np.zeros((h, w, 3), dtype=np.uint8)
-
-    gt = np.zeros((h, w), dtype=np.uint8)
-    cv.ellipse(gt, (w // 2, h // 2), (240, 170), 0, 0, 360, 255, thickness=-1)
-
-    base = np.zeros((h, w), dtype=np.uint8)
-    base[gt > 0] = 140
-    noise = rng.normal(0, 10, size=(h, w)).astype(np.float32)
-    g = np.clip(base.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-    img[:, :, 1] = g
-
-    mask = compute_fov_mask(
-        img,
-        blur_kind="gaussian",
-        blur_ksize=7,
-        close_ksize=31,
-        open_ksize=11,
-        do_hole_fill=True,
-        do_convex_hull=True,
-    )
-
-    score = _iou(mask, gt)
-    assert score > 0.93, f"IoU too low on ellipse: {score}"
-
-
-def test_works_on_grayscale_input():
-    h, w = 300, 300
-    gray = np.zeros((h, w), dtype=np.uint8)
-    cv.circle(gray, (150, 150), 110, 160, thickness=-1)
-
-    mask = compute_fov_mask(gray, do_hole_fill=True, do_convex_hull=True)
-    assert mask.shape == gray.shape
-    assert mask.dtype == np.uint8
-    assert set(np.unique(mask).tolist()).issubset({0, 255})
-
-
-
-
-    !pip install opencv-python numpy pytest matplotlib
-
 
 import os
 from pathlib import Path
@@ -815,35 +590,6 @@ abs_path = str(img_path.resolve())
 print("cv.haveImageReader =", cv.haveImageReader(abs_path))
 img = cv.imread(abs_path, cv.IMREAD_UNCHANGED)
 print("cv.imread is None? =", img is None)
-
-
-
-
-
-from pathlib import Path
-import os
-
-def find_project_root(start: Path | None = None) -> Path:
-    p = (start or Path.cwd()).resolve()
-    for _ in range(25):
-        if (p / "images" / "input").exists():
-            return p
-        if p.parent == p:
-            break
-        p = p.parent
-    raise FileNotFoundError("Couldn't find a folder containing images/input")
-
-ROOT = find_project_root()
-print("cwd =", os.getcwd())
-print("ROOT =", ROOT)
-
-
-
-import cv2 as cv
-
-img_path = ROOT / "images" / "input" / "4.png"
-img = cv.imread(str(img_path), cv.IMREAD_UNCHANGED)
-print("img is None?", img is None)
 
 
 
@@ -902,8 +648,6 @@ print("Ellipse reason:", dbg.ellipse_reason)
 
 
 
-
-
 %%writefile vessel_pipeline_c.py
 from __future__ import annotations
 
@@ -954,39 +698,7 @@ def _ensure_odd(k: int) -> int:
     if k % 2 == 0:
         k += 1
     return k
-    
-def _remove_small_components(mask_01: Array, min_area: int) -> Tuple[Array, Dict[str, Any]]:
-    """
-    Keep only connected components with area >= min_area.
-    Input: 0/1 uint8.
-    Output: 0/1 uint8.
-    """
-    m = (mask_01 > 0).astype(np.uint8)
-    num, labels, stats, _ = cv.connectedComponentsWithStats(m, connectivity=8)
 
-    kept = np.zeros_like(m, dtype=np.uint8)
-    kept_count = 0
-    removed_count = 0
-    areas_kept = []
-
-    for i in range(1, num):
-        area = int(stats[i, cv.CC_STAT_AREA])
-        if area >= int(min_area):
-            kept[labels == i] = 1
-            kept_count += 1
-            areas_kept.append(area)
-        else:
-            removed_count += 1
-
-    info = {
-        "cc_total": int(num - 1),
-        "cc_kept": int(kept_count),
-        "cc_removed": int(removed_count),
-        "min_area": int(min_area),
-        "areas_kept_min": int(min(areas_kept)) if areas_kept else 0,
-        "areas_kept_max": int(max(areas_kept)) if areas_kept else 0,
-    }
-    return kept, info
 
 def _line_se(length: int, angle_deg: float, thickness: int = 1) -> Array:
     """
@@ -1047,117 +759,39 @@ def _otsu_threshold_from_values(values_uint8: Array) -> int:
 
     return int(thr)
 
-def _percentile_threshold_from_values(values_uint8: Array, target_fg_frac: float) -> int:
+
+def _remove_small_components(mask_01: Array, min_area: int) -> Tuple[Array, Dict[str, Any]]:
     """
-    Pick a threshold so that roughly `target_fg_frac` of pixels are >= thr.
-    (Unsupervised, robust when Otsu is unstable on some images.)
+    Keep only connected components with area >= min_area.
+    Input: 0/1 uint8.
+    Output: 0/1 uint8.
     """
-    v = values_uint8.reshape(-1).astype(np.uint8)
-    if v.size == 0:
-        return 128
-    t = float(np.clip(float(target_fg_frac), 0.001, 0.499))
-    q = np.percentile(v, 100.0 * (1.0 - t))
-    return int(np.clip(int(round(q)), 0, 255))
+    m = (mask_01 > 0).astype(np.uint8)
+    num, labels, stats, _ = cv.connectedComponentsWithStats(m, connectivity=8)
+    kept = np.zeros_like(m, dtype=np.uint8)
 
-def _quick_cleanup_and_stats(
-    binary01: Array,
-    fov01: Array,
-    morph_open_ksize: int,
-    morph_close_ksize: int,
-    min_cc_area: int,
-) -> Tuple[float, int]:
-    """
-    Fast approximation of your final cleanup to guide auto-thresholding.
-    Returns (fg_frac_inside_fov, cc_total_after_small_cc_removal).
-    """
-    m = (binary01 > 0).astype(np.uint8)
-    m[fov01 == 0] = 0
+    kept_count = 0
+    removed_count = 0
+    areas_kept = []
 
-    ok_open = _ensure_odd(morph_open_ksize)
-    ok_close = _ensure_odd(morph_close_ksize)
-    k_open = cv.getStructuringElement(cv.MORPH_ELLIPSE, (ok_open, ok_open))
-    k_close = cv.getStructuringElement(cv.MORPH_ELLIPSE, (ok_close, ok_close))
+    for i in range(1, num):
+        area = int(stats[i, cv.CC_STAT_AREA])
+        if area >= int(min_area):
+            kept[labels == i] = 1
+            kept_count += 1
+            areas_kept.append(area)
+        else:
+            removed_count += 1
 
-    m255 = (m * 255).astype(np.uint8)
-    m255 = cv.morphologyEx(m255, cv.MORPH_OPEN, k_open)
-    m255 = cv.morphologyEx(m255, cv.MORPH_CLOSE, k_close)
-    m_clean = (m255 > 0).astype(np.uint8)
-
-    m_clean, cc_info = _remove_small_components(m_clean, min_area=int(min_cc_area))
-
-    denom = float(np.maximum(1, int(fov01.sum())))
-    fg_frac = float(m_clean.sum()) / denom
-    cc_total = int(cc_info.get("cc_total", 0))
-    return fg_frac, cc_total
-
-def _auto_select_otsu_threshold(
-    vesselness: Array,
-    fov01: Array,
-    thr_otsu: int,
-    otsu_offset: int,
-    morph_open_ksize: int,
-    morph_close_ksize: int,
-    min_cc_area: int,
-    *,
-    fg_min: float = 0.020,
-    fg_max: float = 0.180,
-    fg_target: float = 0.070,
-    sweep_min: int = -32,
-    sweep_max: int = 12,
-    sweep_step: int = 2,
-    use_percentile_fallback: bool = True,
-    verbose: bool = False,
-) -> Tuple[int, Dict[str, Any]]:
-    """
-    Fixes the 'single-image collapse' when Otsu+fixed offset yields an extreme fg fraction.
-    1) Start with (thr_otsu + otsu_offset)
-    2) If fg fraction is out-of-range, sweep offsets (existing hyperparameter) to hit fg_target
-    3) If still bad, fallback to percentile threshold (unsupervised)
-    Returns (thr_final, meta_dict).
-    """
-    def clip_thr(t: int) -> int:
-        return int(np.clip(int(t), 0, 255))
-
-    # initial (current behavior)
-    thr0 = clip_thr(thr_otsu + int(otsu_offset))
-    fg0, cc0 = _quick_cleanup_and_stats((vesselness >= thr0).astype(np.uint8), fov01, morph_open_ksize, morph_close_ksize, min_cc_area)
-
-    if fg_min <= fg0 <= fg_max:
-        return thr0, {"method": "otsu_fixed_offset", "thr_otsu": int(thr_otsu), "thr": int(thr0), "fg": float(fg0), "cc": int(cc0)}
-
-    # sweep offsets (TRY DIFFERENT EXISTING HYPERPARAMETER VALUES)
-    best = (abs(fg0 - fg_target) + 5e-5 * cc0, thr0, fg0, cc0, int(otsu_offset))
-
-    for off in range(int(otsu_offset) + int(sweep_min), int(otsu_offset) + int(sweep_max) + 1, int(sweep_step)):
-        thr = clip_thr(int(thr_otsu) + int(off))
-        fg, cc = _quick_cleanup_and_stats((vesselness >= thr).astype(np.uint8), fov01, morph_open_ksize, morph_close_ksize, min_cc_area)
-        score = abs(fg - fg_target) + 5e-5 * cc
-
-        if score < best[0]:
-            best = (score, thr, fg, cc, off)
-
-    _, thr_best, fg_best, cc_best, off_best = best
-
-    if fg_min <= fg_best <= fg_max:
-        if verbose:
-            print(f"[AutoThr] Otsu fixed-offset bad (fg={fg0:.4f}). Using offset sweep -> off={off_best}, thr={thr_best}, fg={fg_best:.4f}, cc={cc_best}")
-        return int(thr_best), {"method": "otsu_offset_sweep", "thr_otsu": int(thr_otsu), "thr": int(thr_best), "off": int(off_best), "fg": float(fg_best), "cc": int(cc_best)}
-
-    # fallback: percentile threshold (unsupervised)
-    if use_percentile_fallback:
-        vals = vesselness[fov01 > 0].astype(np.uint8)
-        thr_p = _percentile_threshold_from_values(vals, target_fg_frac=float(fg_target))
-        fg_p, cc_p = _quick_cleanup_and_stats((vesselness >= thr_p).astype(np.uint8), fov01, morph_open_ksize, morph_close_ksize, min_cc_area)
-
-        if verbose:
-            print(f"[AutoThr] Sweep still extreme (fg={fg_best:.4f}). Using percentile -> thr={thr_p}, fg={fg_p:.4f}, cc={cc_p}")
-
-        return int(thr_p), {"method": "percentile", "thr": int(thr_p), "fg_target": float(fg_target), "fg": float(fg_p), "cc": int(cc_p)}
-
-    # last resort: best sweep
-    if verbose:
-        print(f"[AutoThr] Using best sweep (still extreme) -> off={off_best}, thr={thr_best}, fg={fg_best:.4f}, cc={cc_best}")
-    return int(thr_best), {"method": "otsu_offset_sweep_extreme", "thr_otsu": int(thr_otsu), "thr": int(thr_best), "off": int(off_best), "fg": float(fg_best), "cc": int(cc_best)}
+    info = {
+        "cc_total": int(num - 1),
+        "cc_kept": int(kept_count),
+        "cc_removed": int(removed_count),
+        "min_area": int(min_area),
+        "areas_kept_min": int(min(areas_kept)) if areas_kept else 0,
+        "areas_kept_max": int(max(areas_kept)) if areas_kept else 0,
+    }
+    return kept, info
 
 
 def segment_vessels_pipeline_c(
@@ -1237,14 +871,8 @@ def segment_vessels_pipeline_c(
     # --- CLAHE inside FOV (avoid amplifying outside background) ---
     tile = int(max(2, clahe_tile_grid_size))
     clahe = cv.createCLAHE(clipLimit=float(clahe_clip_limit), tileGridSize=(tile, tile))
+    clahe_img = clahe.apply(green)
 
-    # Fill outside-FOV with a robust inside intensity before CLAHE (prevents border artifacts)
-    inside = green[fov01 > 0]
-    fill_val = int(np.median(inside)) if inside.size else 0
-    green_filled = green.copy()
-    green_filled[fov01 == 0] = fill_val
-
-    clahe_img = clahe.apply(green_filled)
     clahe_in_fov = clahe_img.copy()
     clahe_in_fov[fov01 == 0] = 0
 
@@ -1286,21 +914,10 @@ def segment_vessels_pipeline_c(
     # --- Threshold ---
     if threshold_mode == "otsu":
         vals = vesselness[fov01 > 0]
-        thr_otsu = _otsu_threshold_from_values(vals)
-
-        thr2, thr_meta = _auto_select_otsu_threshold(
-            vesselness=vesselness,
-            fov01=fov01,
-            thr_otsu=thr_otsu,
-            otsu_offset=otsu_offset,
-            morph_open_ksize=morph_open_ksize,
-            morph_close_ksize=morph_close_ksize,
-            min_cc_area=min_cc_area,
-            verbose=verbose,
-        )
-
-        binary01 = (vesselness >= int(thr2)).astype(np.uint8)
-        thr_used = thr_meta
+        thr = _otsu_threshold_from_values(vals)
+        thr2 = int(np.clip(thr + int(otsu_offset), 0, 255))
+        binary01 = (vesselness >= thr2).astype(np.uint8)
+        thr_used = thr2
     elif threshold_mode == "adaptive":
         bs = _ensure_odd(adaptive_block_size)
         thr_img = cv.adaptiveThreshold(
@@ -1421,205 +1038,6 @@ def vessel_segmentation(input_image_path: Union[str, "os.PathLike[str]"], *, ver
     )
     return seg
 
-
-
-
-
-
-
-
-
-
-
-
-%%writefile test_all.py
-import numpy as np
-import cv2 as cv
-
-from fov_mask import compute_fov_mask
-from vessel_pipeline_c import segment_vessels_pipeline_c
-
-
-def _iou(a: np.ndarray, b: np.ndarray) -> float:
-    a = (a > 0)
-    b = (b > 0)
-    inter = np.logical_and(a, b).sum()
-    union = np.logical_or(a, b).sum()
-    return float(inter) / float(union + 1e-9)
-
-
-def _f1(pred: np.ndarray, gt: np.ndarray) -> float:
-    pred = (pred > 0)
-    gt = (gt > 0)
-    tp = np.logical_and(pred, gt).sum()
-    fp = np.logical_and(pred, np.logical_not(gt)).sum()
-    fn = np.logical_and(np.logical_not(pred), gt).sum()
-    return float(2 * tp) / float(2 * tp + fp + fn + 1e-9)
-
-
-# ----------------------------
-# FOV MASK TESTS (from your earlier test_fov_mask.py)
-# ----------------------------
-
-def test_fov_mask_is_binary_uint8():
-    img = np.zeros((256, 256, 3), dtype=np.uint8)
-    cv.circle(img, (128, 128), 90, (40, 180, 40), thickness=-1)
-    mask = compute_fov_mask(img, do_hole_fill=True, do_convex_hull=True)
-
-    assert mask.dtype == np.uint8
-    vals = set(np.unique(mask).tolist())
-    assert vals.issubset({0, 255})
-    assert 0 in vals and 255 in vals
-
-
-def test_fov_circle_high_iou_with_noise_and_holes():
-    rng = np.random.default_rng(0)
-    h, w = 512, 512
-    img = np.zeros((h, w, 3), dtype=np.uint8)
-
-    gt = np.zeros((h, w), dtype=np.uint8)
-    cv.circle(gt, (w // 2, h // 2), 200, 255, thickness=-1)
-
-    base = np.zeros((h, w), dtype=np.uint8)
-    base[gt > 0] = 150
-    noise = rng.normal(0, 12, size=(h, w)).astype(np.float32)
-    noisy = np.clip(base.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-    holes = gt.copy()
-    for _ in range(40):
-        x = int(rng.integers(w // 2 - 150, w // 2 + 150))
-        y = int(rng.integers(h // 2 - 150, h // 2 + 150))
-        r = int(rng.integers(6, 18))
-        cv.circle(holes, (x, y), r, 0, thickness=-1)
-
-    noisy[holes == 0] = 0
-
-    for _ in range(300):
-        x = int(rng.integers(0, w))
-        y = int(rng.integers(0, h))
-        if gt[y, x] == 0:
-            noisy[y, x] = 255
-
-    img[:, :, 1] = noisy
-
-    mask = compute_fov_mask(
-        img,
-        blur_kind="median",
-        blur_ksize=7,
-        close_ksize=25,
-        open_ksize=9,
-        do_hole_fill=True,
-        do_convex_hull=True,
-    )
-
-    score = _iou(mask, gt)
-    assert score > 0.95, f"IoU too low: {score}"
-
-
-def test_fov_works_on_grayscale_input():
-    h, w = 300, 300
-    gray = np.zeros((h, w), dtype=np.uint8)
-    cv.circle(gray, (150, 150), 110, 160, thickness=-1)
-
-    mask = compute_fov_mask(gray, do_hole_fill=True, do_convex_hull=True)
-    assert mask.shape == gray.shape
-    assert mask.dtype == np.uint8
-    assert set(np.unique(mask).tolist()).issubset({0, 255})
-
-
-# ----------------------------
-# PIPELINE C TESTS
-# ----------------------------
-
-def _make_synthetic_fundus_with_vessels(seed: int = 0):
-    rng = np.random.default_rng(seed)
-    h, w = 512, 512
-    img = np.zeros((h, w, 3), dtype=np.uint8)
-
-    # FOV disk
-    fov = np.zeros((h, w), dtype=np.uint8)
-    cv.circle(fov, (w // 2, h // 2), 210, 255, thickness=-1)
-
-    # background (green channel)
-    bg = np.zeros((h, w), dtype=np.uint8)
-    bg[fov > 0] = 160
-    noise = rng.normal(0, 10, size=(h, w)).astype(np.float32)
-    bg = np.clip(bg.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-    # synthetic vessels: dark curvy-ish poly-lines
-    gt_vessels = np.zeros((h, w), dtype=np.uint8)
-    for k in range(12):
-        x0 = int(rng.integers(w//2 - 120, w//2 + 120))
-        y0 = int(rng.integers(h//2 - 120, h//2 + 120))
-        pts = [(x0, y0)]
-        for _ in range(6):
-            x0 = int(np.clip(x0 + rng.integers(-50, 51), 0, w-1))
-            y0 = int(np.clip(y0 + rng.integers(-50, 51), 0, h-1))
-            pts.append((x0, y0))
-        pts = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
-        thick = int(rng.integers(1, 3))
-        cv.polylines(gt_vessels, [pts], isClosed=False, color=255, thickness=thick)
-
-    # apply vessels into bg (darker)
-    vessel_dark = bg.copy()
-    vessel_dark[gt_vessels > 0] = np.clip(vessel_dark[gt_vessels > 0].astype(np.int16) - 70, 0, 255).astype(np.uint8)
-
-    # add bright optic disc-ish blob (common false-positive source)
-    cv.circle(vessel_dark, (w//2 + 70, h//2 - 40), 35, 230, thickness=-1)
-
-    # outside fov black
-    vessel_dark[fov == 0] = 0
-
-    img[:, :, 1] = vessel_dark  # green channel
-    return img, fov, gt_vessels
-
-
-def test_pipeline_c_output_is_binary_and_masked():
-    img, fov, _gt = _make_synthetic_fundus_with_vessels(seed=1)
-    seg, dbg = segment_vessels_pipeline_c(img, return_debug=True, verbose=False)
-
-    assert seg.dtype == np.uint8
-    vals = set(np.unique(seg).tolist())
-    assert vals.issubset({0, 255})
-
-    # must be zero outside FOV
-    assert int(seg[fov == 0].sum()) == 0
-
-    # FOV mask also binary
-    fov_vals = set(np.unique(dbg.fov_mask).tolist())
-    assert fov_vals.issubset({0, 255})
-
-
-def test_pipeline_c_detects_some_vessels_reasonably():
-    img, fov, gt = _make_synthetic_fundus_with_vessels(seed=2)
-
-    seg = segment_vessels_pipeline_c(
-        img,
-        threshold_mode="otsu",
-        otsu_offset=-5,
-        min_cc_area=15,
-        morph_close_ksize=5,
-        return_debug=False,
-        verbose=False,
-    )
-
-    # evaluate only inside true FOV
-    seg_in = seg.copy()
-    seg_in[fov == 0] = 0
-    gt_in = gt.copy()
-    gt_in[fov == 0] = 0
-
-    # We use a forgiving threshold because this is a heuristic baseline.
-    f1 = _f1(seg_in, gt_in)
-    assert f1 > 0.25, f"F1 too low for synthetic vessels: {f1}"
-
-
-
-
-
-
-
-
 import os
 from pathlib import Path
 import cv2 as cv
@@ -1680,51 +1098,6 @@ for img in imgs:
 meanIoU /= max(1, len(imgs))
 print("------------------------------------")
 print(f"Mean IoU={meanIoU:.6f}")
-
-
-
-
-
-
-from pathlib import Path
-import cv2 as cv
-from matplotlib import pyplot as plt
-
-from vessel_pipeline_c import segment_vessels_pipeline_c
-ROOT = find_project_root()
-
-img_path = ROOT / "images" / "input" / "1.png"
-img = cv.imread(str(img_path), cv.IMREAD_COLOR)
-seg, dbg = segment_vessels_pipeline_c(
-    img,
-    verbose=True,
-    return_debug=True,
-
-    # If you want to tune quickly:
-    # otsu_offset=-8,        # more sensitive
-    # min_cc_area=15,        # keep smaller fragments
-    # morph_close_ksize=7,   # connect gaps more
-)
-
-plt.figure(figsize=(18, 10))
-plt.subplot(2,4,1); plt.title("Green");        plt.imshow(dbg.green, cmap="gray"); plt.axis("off")
-plt.subplot(2,4,2); plt.title("FOV mask");     plt.imshow(dbg.fov_mask, cmap="gray"); plt.axis("off")
-plt.subplot(2,4,3); plt.title("CLAHE");        plt.imshow(dbg.clahe, cmap="gray"); plt.axis("off")
-plt.subplot(2,4,4); plt.title("Vesselness");   plt.imshow(dbg.vesselness, cmap="gray"); plt.axis("off")
-plt.subplot(2,4,5); plt.title("Binary raw");   plt.imshow(dbg.binary_raw, cmap="gray"); plt.axis("off")
-plt.subplot(2,4,6); plt.title("Binary clean"); plt.imshow(dbg.binary_clean, cmap="gray"); plt.axis("off")
-plt.subplot(2,4,7); plt.title("Final");        plt.imshow(dbg.final, cmap="gray"); plt.axis("off")
-plt.tight_layout()
-plt.show()
-
-print("Params:", dbg.params)
-print("Stats:", dbg.stats)
-
-
-
-
-
-
 
 
 # === Grid search (hand-picked combos) for Pipeline C ===
@@ -2110,3 +1483,4 @@ rank = pd.DataFrame(ALL_RESULTS).sort_values(["mean_iou", "median_iou"], ascendi
 print("\n" + "#"*90)
 print("RANKING (sorted by mean IoU desc):")
 display(rank)
+
