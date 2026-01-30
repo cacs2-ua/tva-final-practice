@@ -15,7 +15,7 @@ def vessel_segmentation(input_image: str, *, verbose: bool = False, return_debug
     if img is None:
         raise FileNotFoundError(f"Could not read image: {input_image}")
 
-    # 1) FOV mask
+    # 1) FOV mask (matches your sensitive_thin FOV params)
     fov_mask = compute_fov_mask(
         img,
         blur_kind="median",
@@ -29,18 +29,20 @@ def vessel_segmentation(input_image: str, *, verbose: bool = False, return_debug
         return_debug=False,
     )
 
-    # 2) Pipeline D params
+    # 2) Pipeline D params (matches your sensitive_thin Vessel params)
     params = VesselMorphParams(
-        verbose=verbose,
+        verbose=False,
         use_clahe=True,
-        clahe_clip_limit=2.5,
+        clahe_clip_limit=3.0,
         clahe_tile=8,
-        post_close_ksize=3,
+        post_close_ksize=5,
         post_open_ksize=3,
-        cc_min_area=25,
-        cc_min_elongation=2.2,
-        cc_max_extent=0.45,
-        cc_max_area_frac=0.15,
+        thresh_method="percentile",
+        thresh_percentile=88.0,
+        cc_min_area=10,
+        cc_min_elongation=1.7,
+        cc_max_extent=0.65,
+        cc_max_area_frac=0.3,
     )
 
     out = segment_vessels_morphology(img, fov_mask, params=params, return_debug=return_debug)
