@@ -446,4 +446,3 @@ def vessel_segmentation(
     )
 
     return filtered
-
