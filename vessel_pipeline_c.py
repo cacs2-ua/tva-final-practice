@@ -489,6 +489,7 @@ def segment_vessels_pipeline_c(
 def vessel_segmentation(input_image_path: Union[str, "os.PathLike[str]"], *, verbose: bool = False) -> Array:
     """
     Drop-in replacement for the course skeleton: reads path, returns 0/255 uint8 segmentation.
+    Uses the tuned Pipeline C hyperparameters you provided.
     """
     img = cv.imread(str(input_image_path), cv.IMREAD_COLOR)
     if img is None:
@@ -496,19 +497,19 @@ def vessel_segmentation(input_image_path: Union[str, "os.PathLike[str]"], *, ver
 
     seg = segment_vessels_pipeline_c(
         img,
-        # reasonable defaults for DRIVE-like images
-        clahe_clip_limit=2.0,
+        clahe_clip_limit=3.5,
         clahe_tile_grid_size=8,
         enhance_mode="blackhat",
         line_lengths=(9, 13, 17),
+        line_thickness=1,
         n_angles=12,
         add_disk_blackhat=True,
         disk_sizes=(9, 13),
         threshold_mode="otsu",
-        otsu_offset=-5,
+        otsu_offset=-6,
         morph_open_ksize=3,
         morph_close_ksize=5,
-        min_cc_area=30,
+        min_cc_area=25,
         verbose=verbose,
         return_debug=False,
     )
