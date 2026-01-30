@@ -182,26 +182,52 @@ def _remove_small_components(mask_u8: Array, min_area: int) -> Array:
             out[labels == lab] = 255
     return out
 
-
-def _cleanup_binary(mask_u8: Array, fov: Array, *, h: int, w: int, verbose: bool) -> Array:
+def _cleanup_binary(
+    mask_u8: Array,
+    fov: Array,
+    *,
+    h: int,
+    w: int,
+    verbose: bool,
+    morph_close_ksize: int = 3,
+    morph_close_iter: int = 1,
+    morph_open_ksize: int = 3,
+    morph_open_iter: int = 1,
+    cc_min_area: Optional[int] = None,
+) -> Array:
     """
-    Cleanup as in the Pipeline B description:
+    Cleanup:
       - closing to improve continuity
       - opening to remove specks
       - connected components filtering (remove small objects)
       - enforce FOV
+    Defaults are EXACTLY the previous behavior.
     """
     mask_u8 = (mask_u8 > 0).astype(np.uint8) * 255
     fov_u8 = (fov > 0).astype(np.uint8) * 255
 
-    # mild morphology
-    k_close = cv.getStructuringElement(cv.MORPH_ELLIPSE, (3, 3))
-    k_open = cv.getStructuringElement(cv.MORPH_ELLIPSE, (3, 3))
-    m = cv.morphologyEx(mask_u8, cv.MORPH_CLOSE, k_close, iterations=1)
-    m = cv.morphologyEx(m, cv.MORPH_OPEN, k_open, iterations=1)
+    morph_close_ksize = _ensure_odd(int(morph_close_ksize))
+    morph_open_ksize = _ensure_odd(int(morph_open_ksize))
+    morph_close_iter = max(0, int(morph_close_iter))
+    morph_open_iter = max(0, int(morph_open_iter))
 
-    # remove tiny CCs (relative to image size)
-    min_area = max(40, int(round(0.00006 * h * w)))  # ~27 for DRIVE; we clamp to 40
+    # morphology
+    k_close = cv.getStructuringElement(cv.MORPH_ELLIPSE, (morph_close_ksize, morph_close_ksize))
+    k_open = cv.getStructuringElement(cv.MORPH_ELLIPSE, (morph_open_ksize, morph_open_ksize))
+
+    m = mask_u8
+    if morph_close_iter > 0:
+        m = cv.morphologyEx(m, cv.MORPH_CLOSE, k_close, iterations=morph_close_iter)
+    if morph_open_iter > 0:
+        m = cv.morphologyEx(m, cv.MORPH_OPEN, k_open, iterations=morph_open_iter)
+
+    # CC filtering
+    if cc_min_area is None:
+        # EXACTLY the old rule:
+        min_area = max(40, int(round(0.00006 * h * w)))
+    else:
+        min_area = max(1, int(cc_min_area))
+
     m2 = _remove_small_components(m, min_area=min_area)
 
     # enforce FOV hard
@@ -209,9 +235,15 @@ def _cleanup_binary(mask_u8: Array, fov: Array, *, h: int, w: int, verbose: bool
 
     if verbose:
         frac = float(np.mean(m2 > 0))
-        print(f"[PipelineB][cleanup] min_area={min_area} | vessel_frac={frac:.4f}")
+        print(
+            f"[PipelineB][cleanup] "
+            f"close={morph_close_ksize}x{morph_close_ksize} it={morph_close_iter} | "
+            f"open={morph_open_ksize}x{morph_open_ksize} it={morph_open_iter} | "
+            f"min_area={min_area} | vessel_frac={frac:.4f}"
+        )
 
     return m2
+
 
 
 # ---------------------------
@@ -222,20 +254,62 @@ def vessel_segmentation(
     input_image: Union[str, Array],
     *,
     verbose: bool = False,
+
+    # --- cleanup / CC ---
+    cc_min_area: Optional[int] = None,
+
+    # --- CLAHE ---
+    clahe_clip_limit: float = 2.0,
+    clahe_tile_grid_size: Tuple[int, int] = (8, 8),
+
+    # --- Enhancement ---
+    enhance_mode: str = "auto",  # "auto" | "blackhat" | "tophat"
+    line_lengths: Optional[Tuple[int, ...]] = None,  # None => auto length (old behavior)
+    n_angles: int = 12,
+
+    # --- KMeans ---
+    k: int = 2,
+    use_grad: bool = True,
+
+    # --- FOV params ---
+    fov_blur_kind: str = "median",
+    fov_blur_ksize: int = 7,
+    fov_close_ksize: Optional[int] = None,
+    fov_open_ksize: Optional[int] = None,
+    fov_do_convex_hull: bool = True,
+    fov_ellipse_mode: str = "auto",
+    fov_ellipse_scale: float = 1.01,
+
+    # --- Morph cleanup params ---
+    morph_close_iter: int = 1,
+    morph_close_ksize: int = 3,
+    morph_open_iter: int = 1,
+    morph_open_ksize: int = 3,
 ) -> Array:
     """
     Pipeline B: Morphology → k-means → cleanup
 
-    Steps:
-      1) FOV mask (retina mask)
-      2) green channel
-      3) CLAHE contrast normalization
-      4) vessel boosting via multi-orientation black-hat / top-hat (pick best)
-      5) k-means clustering on per-pixel features (enhanced intensity + gradient)
-      6) cleanup morphology + CC filtering
-    Returns:
-      binary mask uint8 (0/255) same HxW as input.
+    IMPORTANT:
+    - All defaults preserve the old behavior.
+    - This function now accepts hyperparameters via **PARAMS.
     """
+
+    def _as_tile_grid(x) -> Tuple[int, int]:
+        if isinstance(x, (list, tuple)) and len(x) == 2:
+            return (int(x[0]), int(x[1]))
+        return (int(x), int(x))
+
+    def _parse_line_lengths(hh: int, ww: int):
+        if line_lengths is None:
+            return [_auto_line_length(hh, ww)]  # EXACT old behavior
+        if isinstance(line_lengths, (int, np.integer)):
+            return [_ensure_odd(int(line_lengths))]
+        # tuple/list of ints
+        out = []
+        for L in line_lengths:
+            out.append(_ensure_odd(int(L)))
+        return out
+
     # --- Load ---
     if isinstance(input_image, str):
         img = cv.imread(input_image, cv.IMREAD_UNCHANGED)
@@ -248,18 +322,17 @@ def vessel_segmentation(
     h, w = g.shape[:2]
 
     # --- FOV mask ---
-    # Use robust defaults from your existing fov_mask.py
     fov = compute_fov_mask(
         img,
-        blur_kind="median",
-        blur_ksize=7,
-        close_ksize=None,   # auto
-        open_ksize=None,    # auto
+        blur_kind=str(fov_blur_kind),
+        blur_ksize=int(fov_blur_ksize),
+        close_ksize=fov_close_ksize,
+        open_ksize=fov_open_ksize,
         do_hole_fill=True,
-        do_convex_hull=True,
-        ellipse_mode="auto",
-        ellipse_scale=1.01,
-        ellipse_min_fill_ratio=0.975,
+        do_convex_hull=bool(fov_do_convex_hull),
+        ellipse_mode=str(fov_ellipse_mode),
+        ellipse_scale=float(fov_ellipse_scale),
+        ellipse_min_fill_ratio=0.975,   # keep your robust default
         return_debug=False,
     )
     fov_u8 = (fov > 0).astype(np.uint8) * 255
@@ -270,67 +343,92 @@ def vessel_segmentation(
         print(f"[PipelineB] FOV pixels={n_fov} ({n_fov / float(h*w + 1e-9):.3f} of image)")
 
     # --- CLAHE ---
-    clahe = _clahe(g, clip_limit=2.0, tile_grid=(8, 8))
-    clahe[fov_u8 == 0] = 0  # don’t propagate outside
+    tg = _as_tile_grid(clahe_tile_grid_size)
+    clahe = _clahe(g, clip_limit=float(clahe_clip_limit), tile_grid=tg)
+    clahe[fov_u8 == 0] = 0
 
-    # --- Multi-orientation morphology boosting (try both) ---
-    line_len = _auto_line_length(h, w)
-    angles = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165]
+    # --- Enhancement (multi-length + multi-angle; choose best) ---
+    n_angles = int(n_angles)
+    n_angles = max(1, n_angles)
+    angles = np.linspace(0.0, 180.0, n_angles, endpoint=False).tolist()
 
-    # Candidate A: black-hat on CLAHE (vessels are dark lines => black-hat highlights them)
-    enh_blackhat = _multi_orient_morph(clahe, cv.MORPH_BLACKHAT, line_length=line_len, angles=angles)
+    lengths = _parse_line_lengths(h, w)
 
-    # Candidate B: invert + top-hat (sometimes works better if vessels become bright)
-    inv = cv.bitwise_not(clahe)
-    enh_tophat = _multi_orient_morph(inv, cv.MORPH_TOPHAT, line_length=line_len, angles=angles)
-
-    score_a = _percentile_score(enh_blackhat, fov_u8)
-    score_b = _percentile_score(enh_tophat, fov_u8)
-
-    if score_b > score_a:
-        enh = enh_tophat
-        enh_mode = "invert+tophat"
-        enh_score = score_b
+    mode = str(enhance_mode).strip().lower()
+    if mode in ("invert+tophat", "tophat"):
+        mode = "tophat"
+    elif mode == "blackhat":
+        mode = "blackhat"
     else:
-        enh = enh_blackhat
-        enh_mode = "blackhat"
-        enh_score = score_a
+        mode = "auto"
 
-    if verbose:
-        print(f"[PipelineB] line_len={line_len} angles={len(angles)}")
-        print(f"[PipelineB] enh scores: blackhat={score_a:.4f} | invert+tophat={score_b:.4f} -> chosen={enh_mode} ({enh_score:.4f})")
-        vals = enh[fov_u8 > 0]
-        print(f"[PipelineB] enh stats in FOV: min={int(vals.min())} p50={int(np.percentile(vals,50))} p95={int(np.percentile(vals,95))} max={int(vals.max())}")
+    best_score = -1e18
+    best_enh = None
+    best_desc = "none"
 
+    inv = cv.bitwise_not(clahe)
+
+    for L in lengths:
+        if mode in ("auto", "blackhat"):
+            enh_blackhat = _multi_orient_morph(clahe, cv.MORPH_BLACKHAT, line_length=L, angles=angles)
+            sc = _percentile_score(enh_blackhat, fov_u8)
+            if sc > best_score:
+                best_score = sc
+                best_enh = enh_blackhat
+                best_desc = f"blackhat|L={L}|angles={n_angles}"
+
+        if mode in ("auto", "tophat"):
+            enh_tophat = _multi_orient_morph(inv, cv.MORPH_TOPHAT, line_length=L, angles=angles)
+            sc = _percentile_score(enh_tophat, fov_u8)
+            if sc > best_score:
+                best_score = sc
+                best_enh = enh_tophat
+                best_desc = f"tophat(inv)|L={L}|angles={n_angles}"
+
+    if best_enh is None:
+        # safety fallback
+        best_enh = np.zeros_like(clahe)
+        best_desc = "fallback_zero"
+
+    enh = best_enh
     enh[fov_u8 == 0] = 0
 
-    # --- Feature image for clustering ---
-    # Feature 1: enhanced intensity (strong vesselness response)
-    # Feature 2: gradient magnitude on CLAHE (vessel edges help clustering)
-    clahe_f = clahe.astype(np.float32)
-    gx = cv.Sobel(clahe_f, cv.CV_32F, 1, 0, ksize=3)
-    gy = cv.Sobel(clahe_f, cv.CV_32F, 0, 1, ksize=3)
-    grad = cv.magnitude(gx, gy)
-    grad_u8 = _to_uint8(grad)
+    if verbose:
+        print(f"[PipelineB] enhance_mode={enhance_mode} -> chosen={best_desc} score={best_score:.4f}")
+        vals = enh[fov_u8 > 0]
+        if vals.size > 0:
+            print(
+                f"[PipelineB] enh stats in FOV: "
+                f"min={int(vals.min())} p50={int(np.percentile(vals,50))} "
+                f"p95={int(np.percentile(vals,95))} max={int(vals.max())}"
+            )
 
-    # Flatten only inside FOV
+    # --- Features for KMeans ---
     idx = np.flatnonzero((fov_u8 > 0).ravel())
     if idx.size < 200:
-        # pathological; return empty
         if verbose:
             print("[PipelineB] Too few FOV pixels; returning empty mask.")
         return np.zeros((h, w), dtype=np.uint8)
 
     enh_flat = enh.ravel()[idx].astype(np.float32)
-    grad_flat = grad_u8.ravel()[idx].astype(np.float32)
 
-    X = np.stack([enh_flat, grad_flat], axis=1).astype(np.float32)
+    feats = [enh_flat]
 
-    # Standardize features (important for kmeans stability)
-    # Fit on a subset for speed, then assign all pixels.
+    if bool(use_grad):
+        clahe_f = clahe.astype(np.float32)
+        gx = cv.Sobel(clahe_f, cv.CV_32F, 1, 0, ksize=3)
+        gy = cv.Sobel(clahe_f, cv.CV_32F, 0, 1, ksize=3)
+        grad = cv.magnitude(gx, gy)
+        grad_u8 = _to_uint8(grad)
+        grad_flat = grad_u8.ravel()[idx].astype(np.float32)
+        feats.append(grad_flat)
+
+    X = np.stack(feats, axis=1).astype(np.float32)  # NxD
+
+    # Standardize (keep deterministic)
     rng = np.random.default_rng(0)
     n = X.shape[0]
-    n_fit = min(120_000, n)  # speed cap
+    n_fit = min(120_000, n)
     sel = rng.choice(n, size=n_fit, replace=False) if n_fit < n else np.arange(n)
     X_fit = X[sel]
 
@@ -340,28 +438,46 @@ def vessel_segmentation(
     Xs_all = _standardize(X, mean, std).astype(np.float32)
 
     # --- KMeans ---
-    k = 2
+    k = int(k)
+    k = max(2, k)
+
     centers, compactness = _kmeans_fit_centers(Xs_fit, k, seed=0, attempts=5, max_iter=60, eps=1e-3)
     labels_all = _assign_to_centers(Xs_all, centers)
 
-    # Pick vessel cluster: the one with higher mean in the ORIGINAL enhanced feature (not standardized)
-    m0 = float(enh_flat[labels_all == 0].mean()) if np.any(labels_all == 0) else -1.0
-    m1 = float(enh_flat[labels_all == 1].mean()) if np.any(labels_all == 1) else -1.0
-    vessel_lab = 1 if m1 > m0 else 0
+    # Pick vessel cluster: highest mean in ORIGINAL enhanced feature
+    means = []
+    for lab in range(k):
+        if np.any(labels_all == lab):
+            means.append(float(enh_flat[labels_all == lab].mean()))
+        else:
+            means.append(-1e18)
+    vessel_lab = int(np.argmax(means))
 
     if verbose:
-        print(f"[PipelineB] kmeans: k={k} compactness={compactness:.2f}")
-        print(f"[PipelineB] cluster mean(enh): lab0={m0:.2f} lab1={m1:.2f} -> vessel_lab={vessel_lab}")
+        print(f"[PipelineB] kmeans: k={k} compactness={compactness:.2f} use_grad={bool(use_grad)}")
+        print(f"[PipelineB] cluster mean(enh): {means} -> vessel_lab={vessel_lab}")
 
     # Build mask
     mask = np.zeros((h * w,), dtype=np.uint8)
     mask[idx[labels_all == vessel_lab]] = 255
     mask = mask.reshape((h, w))
 
-    # --- Cleanup ---
-    mask = _cleanup_binary(mask, fov_u8, h=h, w=w, verbose=verbose)
+    # --- Cleanup (now hyperparameterized) ---
+    mask = _cleanup_binary(
+        mask,
+        fov_u8,
+        h=h,
+        w=w,
+        verbose=verbose,
+        morph_close_ksize=morph_close_ksize,
+        morph_close_iter=morph_close_iter,
+        morph_open_ksize=morph_open_ksize,
+        morph_open_iter=morph_open_iter,
+        cc_min_area=cc_min_area,
+    )
 
     if verbose:
         print(f"[PipelineB] output unique={set(np.unique(mask).tolist())} shape={mask.shape}")
 
     return mask
+
